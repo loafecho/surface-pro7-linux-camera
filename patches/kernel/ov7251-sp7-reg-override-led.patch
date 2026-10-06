@@ -1,0 +1,113 @@
+media: SP7 IR: ov7251 register overrides and delayed IR emitter
+
+diff --git a/drivers/media/i2c/ov7251.c b/drivers/media/i2c/ov7251.c
+index db2843bf2..ed7a7cb22 100644
+--- a/drivers/media/i2c/ov7251.c
++++ b/drivers/media/i2c/ov7251.c
+@@ -16,6 +16,7 @@
+ #include <linux/module.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/pm_runtime.h>
++#include <linux/workqueue.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/slab.h>
+ #include <linux/types.h>
+@@ -123,6 +124,8 @@ enum supported_link_freqs {
+ };
+ 
+ struct ov7251 {
++	struct delayed_work led_work;
++	bool led_streaming;
+ 	struct i2c_client *i2c_client;
+ 	struct device *dev;
+ 	struct v4l2_subdev sd;
+@@ -1334,6 +1337,46 @@ static int ov7251_get_selection(struct v4l2_subdev *sd,
+ 	return 0;
+ }
+ 
++/*
++ * Bring-up aid (Surface Pro 7 IR): extra register writes applied after the
++ * mode table and controls on every stream start, as (reg << 8) | value,
++ * e.g. 0x480064 writes 0x64 to 0x4800. Up to 8 entries, 0 = unused.
++ */
++static uint reg_override[8];
++static int reg_override_count;
++module_param_array(reg_override, uint, &reg_override_count, 0644);
++MODULE_PARM_DESC(reg_override, "Extra (reg<<8)|val writes at stream start");
++
++/*
++ * Surface Pro 7 IR emitter: writes applied led_delay_ms after the latest
++ * stream start (same encoding as reg_override). The emitter's current pulses
++ * make the IPU4 IR link lock less often, and the IPU retries a failed lock by
++ * restarting the sensor, so the emitter only comes on once streaming has
++ * stayed up for a while.
++ */
++static uint led_regs[8];
++static int led_regs_count;
++module_param_array(led_regs, uint, &led_regs_count, 0644);
++MODULE_PARM_DESC(led_regs, "(reg<<8)|val writes that turn the IR emitter on, after led_delay_ms");
++
++static uint led_delay_ms = 1000;
++module_param(led_delay_ms, uint, 0644);
++MODULE_PARM_DESC(led_delay_ms, "Delay after stream start before led_regs are written");
++
++static void ov7251_led_work(struct work_struct *work)
++{
++	struct ov7251 *ov7251 = container_of(to_delayed_work(work),
++					     struct ov7251, led_work);
++
++	mutex_lock(&ov7251->lock);
++	if (ov7251->led_streaming)
++		for (int i = 0; i < ARRAY_SIZE(led_regs); i++)
++			if (led_regs[i])
++				ov7251_write_reg(ov7251, led_regs[i] >> 8,
++						 led_regs[i] & 0xff);
++	mutex_unlock(&ov7251->lock);
++}
++
+ static int ov7251_s_stream(struct v4l2_subdev *subdev, int enable)
+ {
+ 	struct ov7251 *ov7251 = to_ov7251(subdev);
+@@ -1368,11 +1411,25 @@ static int ov7251_s_stream(struct v4l2_subdev *subdev, int enable)
+ 			dev_err(ov7251->dev, "could not sync v4l2 controls\n");
+ 			goto err_power_down;
+ 		}
++		for (int i = 0; i < ARRAY_SIZE(reg_override); i++) {
++			if (!reg_override[i])
++				continue;
++			ret = ov7251_write_reg(ov7251, reg_override[i] >> 8,
++					       reg_override[i] & 0xff);
++			if (ret)
++				goto err_power_down;
++		}
+ 		ret = ov7251_write_reg(ov7251, OV7251_SC_MODE_SELECT,
+ 				       OV7251_SC_MODE_SELECT_STREAMING);
+ 		if (ret)
+ 			goto err_power_down;
++		ov7251->led_streaming = true;
++		if (led_regs[0])
++			mod_delayed_work(system_wq, &ov7251->led_work,
++					 msecs_to_jiffies(led_delay_ms));
+ 	} else {
++		ov7251->led_streaming = false;
++		cancel_delayed_work(&ov7251->led_work);
+ 		ret = ov7251_write_reg(ov7251, OV7251_SC_MODE_SELECT,
+ 				       OV7251_SC_MODE_SELECT_SW_STANDBY);
+ 		pm_runtime_put(ov7251->dev);
+@@ -1698,6 +1755,7 @@ static int ov7251_probe(struct i2c_client *client)
+ 	}
+ 
+ 	mutex_init(&ov7251->lock);
++	INIT_DELAYED_WORK(&ov7251->led_work, ov7251_led_work);
+ 
+ 	ov7251->current_mode = &ov7251_mode_info_data[0];
+ 	ret = ov7251_init_ctrls(ov7251);
+@@ -1789,6 +1847,8 @@ static void ov7251_remove(struct i2c_client *client)
+ 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+ 	struct ov7251 *ov7251 = to_ov7251(sd);
+ 
++	cancel_delayed_work_sync(&ov7251->led_work);
++
+ 	v4l2_async_unregister_subdev(&ov7251->sd);
+ 	media_entity_cleanup(&ov7251->sd.entity);
+ 	v4l2_ctrl_handler_free(&ov7251->ctrls);

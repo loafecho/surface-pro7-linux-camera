@@ -1,0 +1,101 @@
+--- a/drivers/media/i2c/ov5693.c
++++ b/drivers/media/i2c/ov5693.c
+@@ -154,6 +154,9 @@
+ 		unsigned int vts;
+ 	} mode;
+ 
++	/* Horizontal flip bits currently cleared in OV5693_FORMAT2_REG */
++	bool hflip_regs_off;
++
+ 	struct v4l2_subdev sd;
+ 	struct media_pad pad;
+ 
+@@ -172,6 +175,22 @@
+ 	} ctrls;
+ };
+ 
++/*
++ * Surface Pro 7: the module's natural (unmirrored) readout has the horizontal
++ * flip bits set (the global register list writes 0x3821 = 0x1e). Treat the
++ * HFLIP control as relative to that, so libcamera's H+V flip for Rotation 180
++ * produces an unmirrored image. Clearing the flip bits moves the Bayer phase by
++ * one column; starting the ISP output window one pixel in restores BGGR (the
++ * crop start register ignores odd values, and the ISP-only mirror bit mirrors).
++ */
++static bool hflip_invert = true;
++module_param(hflip_invert, bool, 0644);
++MODULE_PARM_DESC(hflip_invert, "Invert HFLIP relative to the flip register bits (Surface Pro 7)");
++
++static int hflip_xoff = 1;
++module_param(hflip_xoff, int, 0644);
++MODULE_PARM_DESC(hflip_xoff, "ISP window X offset while the flip bits are cleared, keeps the Bayer order");
++
+ static const struct cci_reg_sequence ov5693_global_regs[] = {
+ 	{CCI_REG8(0x3016), 0xf0},
+ 	{CCI_REG8(0x3017), 0xf0},
+@@ -368,19 +387,39 @@
+ 	return 0;
+ }
+ 
++static int ov5693_crop_x_configure(struct ov5693_device *ov5693, int *err)
++{
++	const struct v4l2_rect *crop = &ov5693->mode.crop;
++	int xoff = ov5693->hflip_regs_off ? clamp(hflip_xoff, 0, 15) : 0;
++	int start = clamp_t(int, crop->left, 0,
++			    OV5693_NATIVE_WIDTH - crop->width - xoff);
++
++	/* The ISP window starts xoff pixels into the crop, so widen the crop */
++	cci_write(ov5693->regmap, OV5693_CROP_START_X_REG, start, err);
++	cci_write(ov5693->regmap, OV5693_CROP_END_X_REG,
++		  start + crop->width + xoff, err);
++	cci_write(ov5693->regmap, OV5693_OFFSET_START_X_REG, xoff, err);
++
++	return err ? *err : 0;
++}
++
+ static int ov5693_flip_horz_configure(struct ov5693_device *ov5693,
+ 				      bool enable)
+ {
+ 	u8 bits = OV5693_FORMAT2_FLIP_HORZ_ISP_EN |
+ 		  OV5693_FORMAT2_FLIP_HORZ_SENSOR_EN;
++	bool regs_on = enable != hflip_invert;
+ 	int ret;
+ 
+ 	ret = cci_update_bits(ov5693->regmap, OV5693_FORMAT2_REG, bits,
+-			      enable ? bits : 0, NULL);
++			      regs_on ? bits : 0, NULL);
+ 	if (ret)
+ 		return ret;
+ 
+-	return 0;
++	ov5693->hflip_regs_off = !regs_on;
++	ret = 0;
++
++	return ov5693_crop_x_configure(ov5693, &ret);
+ }
+ 
+ static int ov5693_get_exposure(struct ov5693_device *ov5693, s32 *value)
+@@ -554,21 +593,13 @@
+ 	const struct ov5693_mode *mode = &ov5693->mode;
+ 	int ret = 0;
+ 
+-	/* Crop Start X */
+-	cci_write(ov5693->regmap, OV5693_CROP_START_X_REG, mode->crop.left,
+-		  &ret);
+-
+-	/* Offset X */
+-	cci_write(ov5693->regmap, OV5693_OFFSET_START_X_REG, 0, &ret);
++	/* Crop X window and ISP X offset (see ov5693_crop_x_configure) */
++	ov5693_crop_x_configure(ov5693, &ret);
+ 
+ 	/* Output Size X */
+ 	cci_write(ov5693->regmap, OV5693_OUTPUT_SIZE_X_REG, mode->format.width,
+ 		  &ret);
+ 
+-	/* Crop End X */
+-	cci_write(ov5693->regmap, OV5693_CROP_END_X_REG,
+-		  mode->crop.left + mode->crop.width, &ret);
+-
+ 	/* Horizontal Total Size */
+ 	cci_write(ov5693->regmap, OV5693_TIMING_HTS_REG, OV5693_FIXED_PPL,
+ 		  &ret);

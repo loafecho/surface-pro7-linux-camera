@@ -1,0 +1,18 @@
+diff --git a/spa/plugins/libcamera/libcamera-source.cpp b/spa/plugins/libcamera/libcamera-source.cpp
+index 8b34c81..a6793f2 100644
+--- a/spa/plugins/libcamera/libcamera-source.cpp
++++ b/spa/plugins/libcamera/libcamera-source.cpp
+@@ -400,6 +400,13 @@ const struct format_info format_info[] = {
+ 	MAKE_FMT(formats::YUV422, Y42B, video, raw),
+ 
+ 	MAKE_FMT(formats::MJPEG, ENCODED, video, mjpg),
++
++	/* Monochrome sensors (e.g. the Surface Pro 7 IR camera). R10/R12 carry the
++	 * samples in the low bits of 16-bit little-endian words. */
++	MAKE_FMT(formats::R8, GRAY8, video, raw),
++	MAKE_FMT(formats::R10, GRAY16_LE, video, raw),
++	MAKE_FMT(formats::R12, GRAY16_LE, video, raw),
++	MAKE_FMT(formats::R16, GRAY16_LE, video, raw),
+ #undef MAKE_FMT
+ };
+ 

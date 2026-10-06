@@ -1,0 +1,111 @@
+diff --git a/include/libcamera/internal/software_isp/debayer_params.h b/include/libcamera/internal/software_isp/debayer_params.h
+index 1c0412d75..b25b18f1d 100644
+--- a/include/libcamera/internal/software_isp/debayer_params.h
++++ b/include/libcamera/internal/software_isp/debayer_params.h
+@@ -18,11 +18,15 @@
+ namespace libcamera {
+ 
+ struct DebayerParams {
+-	Matrix<float, 3, 3> combinedMatrix;
+-	RGB<float> blackLevel;
+-	float gamma;
+-	float contrastExp;
+-	RGB<float> gains;
++	/*
++	 * Defaults matter: the first frame after start can be debayered before
++	 * the IPA has posted its parameters, and Vector does not zero itself.
++	 */
++	Matrix<float, 3, 3> combinedMatrix = Matrix<float, 3, 3>::identity();
++	RGB<float> blackLevel = RGB<float>(0.0f);
++	float gamma = 1.0f;
++	float contrastExp = 1.0f;
++	RGB<float> gains = RGB<float>(1.0f);
+ };
+ 
+ } /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/adjust.cpp b/src/ipa/simple/algorithms/adjust.cpp
+index 068e98404..b7a76b7da 100644
+--- a/src/ipa/simple/algorithms/adjust.cpp
++++ b/src/ipa/simple/algorithms/adjust.cpp
+@@ -24,24 +24,36 @@ constexpr float kDefaultSaturation = 1.0f;
+ 
+ LOG_DEFINE_CATEGORY(IPASoftAdjust)
+ 
+-int Adjust::init(IPAContext &context, [[maybe_unused]] const YamlObject &tuningData)
++int Adjust::init(IPAContext &context, const YamlObject &tuningData)
+ {
++	gamma_ = std::clamp(tuningData["gamma"].get<float>(kDefaultGamma), 0.1f, 10.0f);
++	if (auto c = tuningData["contrast"].get<float>())
++		contrast_ = std::clamp(*c, 0.0f, 2.0f);
++	if (auto s = tuningData["saturation"].get<float>())
++		saturation_ = std::clamp(*s, 0.0f, 2.0f);
++
+ 	context.ctrlMap[&controls::Gamma] =
+-		ControlInfo(0.1f, 10.0f, kDefaultGamma);
++		ControlInfo(0.1f, 10.0f, gamma_);
+ 	context.ctrlMap[&controls::Contrast] =
+-		ControlInfo(0.0f, 2.0f, kDefaultContrast);
++		ControlInfo(0.0f, 2.0f, contrast_.value_or(kDefaultContrast));
+ 	if (context.ccmEnabled)
+ 		context.ctrlMap[&controls::Saturation] =
+-			ControlInfo(0.0f, 2.0f, kDefaultSaturation);
++			ControlInfo(0.0f, 2.0f, saturation_.value_or(kDefaultSaturation));
++
++	LOG(IPASoftAdjust, Debug)
++		<< "Defaults: gamma " << gamma_
++		<< " contrast " << contrast_.value_or(kDefaultContrast)
++		<< " saturation " << saturation_.value_or(kDefaultSaturation);
+ 	return 0;
+ }
+ 
+ int Adjust::configure(IPAContext &context,
+ 		      [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
+-	context.activeState.knobs.gamma = kDefaultGamma;
+-	context.activeState.knobs.contrast = std::optional<float>();
+-	context.activeState.knobs.saturation = std::optional<float>();
++	context.activeState.knobs.gamma = gamma_;
++	context.activeState.knobs.contrast = contrast_;
++	context.activeState.knobs.saturation =
++		context.ccmEnabled ? saturation_ : std::optional<float>();
+ 
+ 	return 0;
+ }
+diff --git a/src/ipa/simple/algorithms/adjust.h b/src/ipa/simple/algorithms/adjust.h
+index fb133b140..ebbd861e1 100644
+--- a/src/ipa/simple/algorithms/adjust.h
++++ b/src/ipa/simple/algorithms/adjust.h
+@@ -43,6 +43,11 @@ public:
+ 
+ private:
+ 	void applySaturation(Matrix<float, 3, 3> &ccm, float saturation);
++
++	/* Defaults, overridable per sensor in the tuning file */
++	float gamma_ = kDefaultGamma;
++	std::optional<float> contrast_;
++	std::optional<float> saturation_;
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
+diff --git a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_isp/debayer_cpu.cpp
+index af7af0a8d..2b3f1205d 100644
+--- a/src/libcamera/software_isp/debayer_cpu.cpp
++++ b/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -12,6 +12,7 @@
+ #include "debayer_cpu.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <stdlib.h>
+ #include <sys/ioctl.h>
+ #include <time.h>
+@@ -754,7 +755,8 @@ void DebayerCpu::updateGammaTable(DebayerParams &params)
+ {
+ 	const RGB<float> blackLevel = params.blackLevel;
+ 	/* Take let's say the green channel black level */
+-	const unsigned int blackIndex = blackLevel[1] * gammaTable_.size();
++	const float black = std::isfinite(blackLevel[1]) ? std::clamp(blackLevel[1], 0.0f, 0.5f) : 0.0f;
++	const unsigned int blackIndex = black * gammaTable_.size();
+ 	const float gamma = params.gamma;
+ 	const float contrastExp = params.contrastExp;
+ 

@@ -1,0 +1,36 @@
+diff --git a/spa/plugins/libcamera/libcamera-device.cpp b/spa/plugins/libcamera/libcamera-device.cpp
+index b25a4eb..e5d3caa 100644
+--- a/spa/plugins/libcamera/libcamera-device.cpp
++++ b/spa/plugins/libcamera/libcamera-device.cpp
+@@ -73,10 +73,7 @@ static std::string cameraModel(const Camera *camera)
+ {
+ 	const ControlList &props = camera->properties();
+ 
+-	if (auto model = props.get(properties::Model))
+-		return std::move(model.value());
+-
+-	return camera->id();
++	return std::string(props.get(properties::Model).value_or(camera->id()));
+ }
+ 
+ static const char *cameraLoc(const Camera *camera)
+diff --git a/spa/plugins/libcamera/libcamera-utils.cpp b/spa/plugins/libcamera/libcamera-utils.cpp
+index 4604f00..60ba3ac 100644
+--- a/spa/plugins/libcamera/libcamera-utils.cpp
++++ b/spa/plugins/libcamera/libcamera-utils.cpp
+@@ -141,9 +141,12 @@ static int spa_libcamera_clear_buffers(struct impl *impl, struct port *port)
+ 			munmap(SPA_PTROFF(b->ptr, -d[0].mapoffset, void),
+ 					d[0].maxsize - d[0].mapoffset);
+ 		}
+-		if (SPA_FLAG_IS_SET(b->flags, BUFFER_FLAG_ALLOCATED)) {
+-			close(d[0].fd);
+-		}
++		/*
++		 * The fd belongs to the libcamera FrameBuffer (SharedFD), which
++		 * closes it when the allocator frees the buffers. Closing it here
++		 * too double-closes it, possibly hitting an fd number reused by
++		 * libcamera in the meantime. Upstream dropped this close as well.
++		 */
+ 		d[0].type = SPA_ID_INVALID;
+ 	}
+ 

@@ -1,0 +1,120 @@
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 1f4b2d394..9fb1e0129 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -24,6 +24,7 @@
+ #include <linux/media-bus-format.h>
+ 
+ #include <libcamera/base/log.h>
++#include <libcamera/base/mutex.h>
+ 
+ #include <libcamera/camera.h>
+ #include <libcamera/color_space.h>
+@@ -424,6 +425,10 @@ public:
+ 
+ 	bool match(DeviceEnumerator *enumerator) override;
+ 
++	bool acquireDevice(Camera *camera) override;
++	void releaseDevice(Camera *camera) override;
++	unsigned int videoUsers(V4L2VideoDevice *video);
++
+ 	V4L2VideoDevice *video(const MediaEntity *entity);
+ 	V4L2Subdevice *subdev(const MediaEntity *entity);
+ 	std::shared_ptr<MediaDevice> converter() { return converter_; }
+@@ -459,6 +464,13 @@ private:
+ 
+ 	std::map<const MediaEntity *, EntityData> entities_;
+ 
++	/*
++	 * Cameras sharing a capture video node (e.g. several sensors routed to
++	 * one receiver) keep it open while any of them is acquired.
++	 */
++	Mutex videoUsersLock_;
++	std::map<V4L2VideoDevice *, unsigned int> videoUsers_;
++
+ 	std::shared_ptr<MediaDevice> converter_;
+ 	bool swIspEnabled_;
+ };
+@@ -1372,7 +1384,21 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
+ 			format.fourcc = data_->video_->toV4L2PixelFormat(cfg.pixelFormat);
+ 			format.size = cfg.size;
+ 
++			/*
++			 * The video node is closed while the camera is not
++			 * acquired, see SimplePipelineHandler::acquireDevice().
++			 */
++			bool opened = false;
++			if (!data_->video_->isOpen()) {
++				if (data_->video_->open() < 0)
++					return Invalid;
++				opened = true;
++			}
++
+ 			int ret = data_->video_->tryFormat(&format);
++			/* Another camera may have acquired the node meanwhile */
++			if (opened && !data_->pipe()->videoUsers(data_->video_))
++				data_->video_->close();
+ 			if (ret < 0)
+ 				return Invalid;
+ 
+@@ -2028,9 +2054,60 @@ bool SimplePipelineHandler::matchDevice(std::shared_ptr<MediaDevice> media,
+ 		registered = true;
+ 	}
+ 
++	/*
++	 * Close the video nodes so the capture device can runtime-suspend
++	 * while no camera is in use. Long-lived camera managers (PipeWire,
++	 * WirePlumber) would otherwise keep it powered permanently. They are
++	 * re-opened from acquireDevice().
++	 */
++	for (auto &[entity, entityData] : entities_) {
++		if (entityData.video)
++			entityData.video->close();
++	}
++
+ 	return registered;
+ }
+ 
++unsigned int SimplePipelineHandler::videoUsers(V4L2VideoDevice *video)
++{
++	MutexLocker locker(videoUsersLock_);
++	auto it = videoUsers_.find(video);
++	return it == videoUsers_.end() ? 0 : it->second;
++}
++
++bool SimplePipelineHandler::acquireDevice(Camera *camera)
++{
++	SimpleCameraData *data = cameraData(camera);
++	MutexLocker locker(videoUsersLock_);
++	unsigned int &users = videoUsers_[data->video_];
++
++	if (!data->video_->isOpen()) {
++		int ret = data->video_->open();
++		if (ret < 0) {
++			LOG(SimplePipeline, Error)
++				<< "Failed to open " << data->video_->deviceNode()
++				<< ": " << strerror(-ret);
++			return false;
++		}
++	}
++
++	users++;
++	return true;
++}
++
++void SimplePipelineHandler::releaseDevice(Camera *camera)
++{
++	SimpleCameraData *data = cameraData(camera);
++	MutexLocker locker(videoUsersLock_);
++	unsigned int &users = videoUsers_[data->video_];
++
++	/* Closing a node another acquired camera still uses crashes its stream */
++	if (users > 0 && --users > 0)
++		return;
++
++	data->video_->close();
++}
++
+ bool SimplePipelineHandler::match(DeviceEnumerator *enumerator)
+ {
+ 	std::shared_ptr<MediaDevice> media;

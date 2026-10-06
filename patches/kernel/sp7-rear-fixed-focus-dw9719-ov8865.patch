@@ -1,0 +1,229 @@
+diff --git a/drivers/media/i2c/dw9719.c b/drivers/media/i2c/dw9719.c
+index b89765521..86d132348 100644
+--- a/drivers/media/i2c/dw9719.c
++++ b/drivers/media/i2c/dw9719.c
+@@ -97,6 +97,22 @@ struct dw9719_device {
+ 	} ctrls;
+ };
+ 
++static int default_focus;
++module_param(default_focus, int, 0644);
++MODULE_PARM_DESC(default_focus, "Lens position (0-1023) applied on power-up; the FOCUS_ABSOLUTE default, or the fixed position with async_register=0");
++
++/*
++ * Surface Pro 7: ipu-bridge links the VCM to the sensor for runtime PM, and
++ * libcamera keeps every lens subdev it finds open, which keeps the lens and so
++ * the sensor powered permanently. The IPU's link-start recovery needs real
++ * sensor power cycles, so with that the rear camera fails most stream starts.
++ * async_register=0 leaves the lens out of the media graph (no subdev node);
++ * the sensor driver powers it while streaming and it sits at default_focus.
++ */
++static bool async_register = true;
++module_param(async_register, bool, 0444);
++MODULE_PARM_DESC(async_register, "Register the lens subdev with V4L2 (0: fixed focus at default_focus, powered by the sensor)");
++
+ static int dw9719_power_down(struct dw9719_device *dw9719)
+ {
+ 	u32 reg_pwr = dw9719->model == DW9718S ? DW9718S_PD : DW9719_CONTROL;
+@@ -262,6 +278,16 @@ static const struct v4l2_ctrl_ops dw9719_ctrl_ops = {
+ 	.s_ctrl = dw9719_set_ctrl,
+ };
+ 
++/* Position to restore on power-up */
++static int dw9719_target_focus(struct dw9719_device *dw9719)
++{
++	if (!async_register)
++		dw9719->ctrls.focus->val = dw9719->ctrls.focus->cur.val =
++			clamp(default_focus, 0, DW9719_MAX_FOCUS_POS);
++
++	return dw9719->ctrls.focus->val;
++}
++
+ static int dw9719_suspend(struct device *dev)
+ {
+ 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+@@ -285,7 +311,7 @@ static int dw9719_resume(struct device *dev)
+ {
+ 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+ 	struct dw9719_device *dw9719 = to_dw9719_device(sd);
+-	int current_focus = dw9719->ctrls.focus->val;
++	int current_focus = dw9719_target_focus(dw9719);
+ 	int ret;
+ 	int val;
+ 
+@@ -302,6 +328,17 @@ static int dw9719_resume(struct device *dev)
+ 		usleep_range(DW9719_CTRL_DELAY_US, DW9719_CTRL_DELAY_US + 10);
+ 	}
+ 
++	/*
++	 * The loop stops short of the target, and in ringing control (SAC)
++	 * mode steps sent while a move is still in progress can be dropped
++	 * (seen on the Surface Pro 7: 176 or 208 instead of 256). Let the lens
++	 * settle, then set the exact target.
++	 */
++	usleep_range(10000, 11000);
++	ret = dw9719_t_focus_abs(dw9719, current_focus);
++	if (ret)
++		goto err_power_down;
++
+ 	return 0;
+ 
+ err_power_down:
+@@ -335,7 +372,8 @@ static int dw9719_init_controls(struct dw9719_device *dw9719)
+ 
+ 	dw9719->ctrls.focus = v4l2_ctrl_new_std(&dw9719->ctrls.handler, ops,
+ 						V4L2_CID_FOCUS_ABSOLUTE, 0,
+-						DW9719_MAX_FOCUS_POS, 1, 0);
++						DW9719_MAX_FOCUS_POS, 1,
++						clamp(default_focus, 0, DW9719_MAX_FOCUS_POS));
+ 
+ 	if (dw9719->ctrls.handler.error) {
+ 		dev_err(dw9719->dev, "Error initialising v4l2 ctrls\n");
+@@ -404,9 +442,11 @@ static int dw9719_probe(struct i2c_client *client)
+ 	pm_runtime_get_noresume(&client->dev);
+ 	pm_runtime_enable(&client->dev);
+ 
+-	ret = v4l2_async_register_subdev(&dw9719->sd);
+-	if (ret < 0)
+-		goto err_pm_runtime;
++	if (async_register) {
++		ret = v4l2_async_register_subdev(&dw9719->sd);
++		if (ret < 0)
++			goto err_pm_runtime;
++	}
+ 
+ 	pm_runtime_set_autosuspend_delay(&client->dev, 1000);
+ 	pm_runtime_use_autosuspend(&client->dev);
+@@ -432,7 +472,8 @@ static void dw9719_remove(struct i2c_client *client)
+ 	struct dw9719_device *dw9719 =
+ 		container_of(sd, struct dw9719_device, sd);
+ 
+-	v4l2_async_unregister_subdev(sd);
++	if (async_register)
++		v4l2_async_unregister_subdev(sd);
+ 	v4l2_ctrl_handler_free(&dw9719->ctrls.handler);
+ 	media_entity_cleanup(&dw9719->sd.entity);
+ 
+@@ -451,6 +492,16 @@ static const struct of_device_id dw9719_of_table[] = {
+ };
+ MODULE_DEVICE_TABLE(of, dw9719_of_table);
+ 
++/*
++ * ipu-bridge instantiates the VCM by name ("dw9719") without an OF node, so
++ * an I2C id table is needed for it to match and autoload (Surface Pro 7 rear).
++ */
++static const struct i2c_device_id dw9719_id_table[] = {
++	{ "dw9719", DW9719 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, dw9719_id_table);
++
+ static DEFINE_RUNTIME_DEV_PM_OPS(dw9719_pm_ops, dw9719_suspend, dw9719_resume,
+ 				 NULL);
+ 
+@@ -462,6 +513,7 @@ static struct i2c_driver dw9719_i2c_driver = {
+ 	},
+ 	.probe = dw9719_probe,
+ 	.remove = dw9719_remove,
++	.id_table = dw9719_id_table,
+ };
+ module_i2c_driver(dw9719_i2c_driver);
+ 
+diff --git a/drivers/media/i2c/ov8865.c b/drivers/media/i2c/ov8865.c
+index a8586df14..2240558bc 100644
+--- a/drivers/media/i2c/ov8865.c
++++ b/drivers/media/i2c/ov8865.c
+@@ -13,6 +13,7 @@
+ #include <linux/module.h>
+ #include <linux/of_graph.h>
+ #include <linux/pm_runtime.h>
++#include <linux/property.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/videodev2.h>
+ #include <media/v4l2-ctrls.h>
+@@ -704,6 +705,9 @@ struct ov8865_sensor {
+ 
+ 	struct ov8865_state state;
+ 	struct ov8865_ctrls ctrls;
++
++	/* Focus lens held powered while streaming */
++	struct device *lens;
+ };
+ 
+ /* Static definitions */
+@@ -2603,6 +2607,47 @@ static int ov8865_ctrls_init(struct ov8865_sensor *sensor)
+ 	return ret;
+ }
+ 
++/*
++ * The libcamera simple pipeline does not drive the VCM, so on the Surface Pro 7
++ * the lens (the "lens-focus" reference, a dw9719 loaded with async_register=0)
++ * is powered here only while streaming, where it moves to its fixed position.
++ * It is suspended synchronously on stream stop, before the sensor's own put:
++ * ipu-bridge makes the lens a runtime PM consumer of the sensor, so a lingering
++ * lens would keep the sensor powered and defeat the IPU's sensor power-cycle
++ * recovery on link-start failures.
++ */
++static void ov8865_lens_power(struct ov8865_sensor *sensor, bool on)
++{
++	struct fwnode_handle *fwnode;
++	struct device *lens;
++
++	if (!on) {
++		if (sensor->lens) {
++			pm_runtime_put_sync_suspend(sensor->lens);
++			put_device(sensor->lens);
++			sensor->lens = NULL;
++		}
++		return;
++	}
++
++	if (sensor->lens)
++		return;
++
++	fwnode = fwnode_find_reference(dev_fwnode(sensor->dev), "lens-focus", 0);
++	if (IS_ERR(fwnode))
++		return;
++	lens = bus_find_device_by_fwnode(&i2c_bus_type, fwnode);
++	fwnode_handle_put(fwnode);
++	if (!lens)
++		return;
++
++	if (!lens->driver || pm_runtime_resume_and_get(lens) < 0) {
++		put_device(lens);
++		return;
++	}
++	sensor->lens = lens;
++}
++
+ /* Subdev Video Operations */
+ 
+ static int ov8865_s_stream(struct v4l2_subdev *subdev, int enable)
+@@ -2615,6 +2660,7 @@ static int ov8865_s_stream(struct v4l2_subdev *subdev, int enable)
+ 		ret = pm_runtime_resume_and_get(sensor->dev);
+ 		if (ret < 0)
+ 			return ret;
++		ov8865_lens_power(sensor, true);
+ 	}
+ 
+ 	mutex_lock(&sensor->mutex);
+@@ -2626,8 +2672,10 @@ static int ov8865_s_stream(struct v4l2_subdev *subdev, int enable)
+ 
+ 	state->streaming = !!enable;
+ 
+-	if (!enable)
++	if (!enable) {
++		ov8865_lens_power(sensor, false);
+ 		pm_runtime_put(sensor->dev);
++	}
+ 
+ 	return 0;
+ }
+@@ -3102,6 +3150,7 @@ static void ov8865_remove(struct i2c_client *client)
+ 	struct ov8865_sensor *sensor = ov8865_subdev_sensor(subdev);
+ 
+ 	v4l2_async_unregister_subdev(subdev);
++	ov8865_lens_power(sensor, false);
+ 	pm_runtime_disable(sensor->dev);
+ 	v4l2_ctrl_handler_free(&sensor->ctrls.handler);
+ 	mutex_destroy(&sensor->mutex);
