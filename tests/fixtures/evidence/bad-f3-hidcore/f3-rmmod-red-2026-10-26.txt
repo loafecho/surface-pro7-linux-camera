@@ -1,0 +1,15 @@
+# ipts-evidence v1
+# kind: f3-rmmod
+# phase: red
+# script: campaign-v2.sh
+# script-sha256: 2222222222222222222222222222222222222222222222222222222222222222
+# host: (redacted)
+# boot-id: 000000000000000000000000000000a2
+# srcversion: FEDCBA9876543210FEDCBA9
+# ko: /var/tmp/ipts-fault.ko
+# safety: deadman=1 panic=10 pstore=0
+# started: 2026-10-26T17:00:00+00:00
+CYCLE 1 src=FEDCBA9876543210FEDCBA9 fault_fired=yes hidraw_stuck=1 rmmod_s=41 rmmod_rc=hang blocked_in=hidcore boot=000000000000000000000000000000a2 t_back=95 after_boot=000000000000000000000000000000a3
+TOUCH-CHECK result=PASS touch=ok
+SUMMARY kind=f3-rmmod phase=red cycles=1 pass=0 hidcore=1
+# finished: 2026-10-26T17:05:00+00:00

@@ -1,0 +1,34 @@
+From 2222222222222222222222222222222222222222 Mon Sep 17 00:00:00 2001
+From: Demo Author <1+demo@users.noreply.github.com>
+To: list@example.org
+Cc: maintainer@example.org
+Date: Mon, 26 Oct 2026 10:00:00 +0000
+Subject: [RFC PATCH 1/2] demo: unlink the entry under one lock
+
+Find and unlink the entry under one write lock, so two waiters can never
+take the same entry.
+
+Assisted-by: LLM
+---
+ drivers/misc/demo.c | 6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/misc/demo.c b/drivers/misc/demo.c
+index 1111111..2222222 100644
+--- a/drivers/misc/demo.c
++++ b/drivers/misc/demo.c
+@@ -10,10 +10,8 @@ static int demo_search(struct demo *d, int code)
+ {
+ 	struct demo_msg *e;
+
+-	down_read(&d->lock);
++	down_write(&d->lock);
+ 	e = demo_find(d, code);
+-	up_read(&d->lock);
+-	down_write(&d->lock);
+ 	list_del(&e->list);
+-	up_write(&d->lock);
++	up_write(&d->lock);
+ 	return 0;
+-- 
+2.43.0

@@ -1,0 +1,24 @@
+From 3333333333333333333333333333333333333333 Mon Sep 17 00:00:00 2001
+From: Demo Author <1+demo@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 10:00:00 +0000
+Subject: [RFC PATCH 2/2] demo: bound the stop wait
+
+Wait at most 20 s for the thread to stop instead of forever.
+
+---
+ drivers/misc/demo.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/misc/demo.c b/drivers/misc/demo.c
+index 2222222..3333333 100644
+--- a/drivers/misc/demo.c
++++ b/drivers/misc/demo.c
+@@ -30,4 +30,5 @@ static void demo_stop(struct demo *d)
+ {
+ 	kthread_stop(d->thread);
+-	wait_for_completion(&d->done);
++	if (!wait_for_completion_timeout(&d->done, 20 * HZ))
++		pr_err("demo: thread did not stop\n");
+ }
+-- 
+2.43.0

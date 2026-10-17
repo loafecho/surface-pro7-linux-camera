@@ -1,0 +1,11 @@
+diff --git a/fault.c b/fault.c
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/fault.c
+@@ -0,0 +1,5 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Test-only: compiled in only with -DDEMO_FAULT_INJECT. */
++static int fault;
++module_param(fault, int, 0644);
++static void f(void) { for (;;) ; }

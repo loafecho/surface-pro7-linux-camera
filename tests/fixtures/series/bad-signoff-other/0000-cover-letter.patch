@@ -1,0 +1,16 @@
+From 1111111111111111111111111111111111111111 Mon Sep 17 00:00:00 2001
+From: Demo Author <1+demo@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 10:00:00 +0000
+Subject: [RFC PATCH 0/2] demo: bound a wait and fix a list race
+
+Two small fixes to a demo driver, used as checker fixtures.
+
+Demo Author (2):
+  demo: unlink the entry under one lock
+  demo: bound the stop wait
+
+ drivers/misc/demo.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+-- 
+2.43.0
