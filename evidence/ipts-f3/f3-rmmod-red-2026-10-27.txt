@@ -1,0 +1,17 @@
+# ipts-evidence v1
+# kind: f3-rmmod
+# phase: red
+# script: campaign-v2.sh
+# script-sha256: 096e29957207563c6a1c3e4904ac682a1673ec69b4ac5ee28ad2a26baa31122b
+# host: (redacted)
+# boot-id: faf9fc5a9f4745f18753d3b2ce72e579
+# srcversion: 2B2E7232CBA3ABFA6FA45CF
+# ko: /var/tmp/ipts-fault.ko
+# safety: deadman=1 panic=10 pstore=0
+# started: 2026-10-27T22:49:20+00:00
+CYCLE 1 src=2B2E7232CBA3ABFA6FA45CF fault_fired=yes hidraw_stuck=0 rmmod_s=1 rmmod_rc=0 blocked_in=none boot=faf9fc5a9f4745f18753d3b2ce72e579 t_back=32 after_boot=f8379041f3184b44a2abc3f5a51c8c33
+CYCLE 2 src=2B2E7232CBA3ABFA6FA45CF fault_fired=yes hidraw_stuck=0 rmmod_s=1 rmmod_rc=0 blocked_in=none boot=f8379041f3184b44a2abc3f5a51c8c33 t_back=32 after_boot=1eed62286a8c4d0e8a940cfadabacbb8
+CYCLE 3 src=2B2E7232CBA3ABFA6FA45CF fault_fired=yes hidraw_stuck=0 rmmod_s=0 rmmod_rc=0 blocked_in=none boot=1eed62286a8c4d0e8a940cfadabacbb8 t_back=31 after_boot=41e7148b3e1d4849b0eeb875c8cf9ec2
+TOUCH-CHECK result=PASS touch=ok
+SUMMARY kind=f3-rmmod phase=red cycles=3 pass=3 hidcore=0
+# finished: 2026-10-27T22:52:08+00:00

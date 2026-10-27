@@ -1,0 +1,202 @@
+diff --git a/Makefile b/Makefile
+index 883896f..512d799 100644
+--- a/Makefile
++++ b/Makefile
+@@ -14,3 +14,7 @@ ipts-objs += mei.o
+ ipts-objs += receiver.o
+ ipts-objs += resources.o
+ ipts-objs += thread.o
++ipts-objs += fault.o
++
++# Test-only switch: make ... IPTS_EXTRA_CFLAGS=-DIPTS_FAULT_INJECT
++ccflags-y += $(IPTS_EXTRA_CFLAGS)
+diff --git a/fault.c b/fault.c
+new file mode 100644
+index 0000000..5c2ca7d
+--- /dev/null
++++ b/fault.c
+@@ -0,0 +1,96 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Test-only fault injection for the IPTS driver. Compiled in only with
++ * -DIPTS_FAULT_INJECT; a normal build compiles this file to nothing. Never
++ * install a fault build for daily use.
++ *
++ * fault=3 spawns a kthread that takes the message lock through the normal
++ * ipts_mei_search() path and then returns (exits) while still holding it. There
++ * is no BUG(), no HID request and no debugfs/sysfs callback on its stack when
++ * it exits, so the only thing it leaves held is ipts's own message lock. That
++ * is the "caller dies holding the lock" case the fixed driver must handle.
++ */
++
++#include <linux/err.h>
++#include <linux/errno.h>
++#include <linux/kthread.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/sched.h>
++
++#include "fault.h"
++#include "mei.h"
++
++#ifdef IPTS_FAULT_INJECT
++
++int ipts_fault;
++
++/*
++ * The MEI context the fault kthread targets, set once by ipts_mei_init(). The
++ * driver binds a single MEI client, so one global is enough.
++ */
++struct ipts_mei *ipts_fault_mei;
++
++/*
++ * The task about to take the message lock through the fault path. Compared
++ * against current in ipts_mei_search(); never dereferenced.
++ */
++struct task_struct *ipts_fault3_holder;
++
++static int ipts_fault3_thread(void *data)
++{
++	struct ipts_mei *mei = data;
++	struct ipts_response rsp = { 0 };
++
++	if (!mei)
++		return -EINVAL;
++
++	/*
++	 * Mark this task as the holder, then take the lock through the normal
++	 * search path. ipts_mei_search() sees current == holder and returns
++	 * -EIO with the lock still held; this task then returns and the kthread
++	 * exits holding only ipts's own message lock.
++	 */
++	WRITE_ONCE(ipts_fault3_holder, current);
++
++	return ipts_mei_recv(mei, IPTS_CMD_READY_FOR_DATA, &rsp, 0);
++}
++
++static int ipts_fault_set(const char *val, const struct kernel_param *kp)
++{
++	int ret = 0;
++	struct task_struct *task = NULL;
++
++	ret = param_set_int(val, kp);
++	if (ret)
++		return ret;
++
++	if (READ_ONCE(ipts_fault) != 3)
++		return 0;
++
++	if (!READ_ONCE(ipts_fault_mei)) {
++		pr_err("ipts: FAULT INJECTION 3: no MEI device bound\n");
++		return -ENODEV;
++	}
++
++	task = kthread_run(ipts_fault3_thread, ipts_fault_mei, "ipts-fault3");
++	if (IS_ERR(task)) {
++		pr_err("ipts: FAULT INJECTION 3: kthread_run failed: %ld\n",
++		       PTR_ERR(task));
++		return PTR_ERR(task);
++	}
++
++	return 0;
++}
++
++static const struct kernel_param_ops ipts_fault_ops = {
++	.set = ipts_fault_set,
++	.get = param_get_int,
++};
++
++module_param_cb(fault, &ipts_fault_ops, &ipts_fault, 0644);
++MODULE_PARM_DESC(fault,
++		 "TEST BUILD ONLY: 3=spawn a kthread that takes the message lock and exits holding it");
++MODULE_INFO(ipts_build, "faultinject-TEST-ONLY");
++
++#endif /* IPTS_FAULT_INJECT */
+diff --git a/fault.h b/fault.h
+new file mode 100644
+index 0000000..c5ce51e
+--- /dev/null
++++ b/fault.h
+@@ -0,0 +1,50 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Test-only fault injection. Compiled in only with -DIPTS_FAULT_INJECT; a
++ * normal build gets empty inline stubs and the same code as without this file.
++ *
++ * fault=3 spawns a kthread that takes the message lock through the normal
++ * ipts_mei_search() path and then returns (exits) while still holding it. There
++ * is no BUG(), no HID request and no debugfs/sysfs callback on its stack when
++ * it exits, so the only thing it leaves held is ipts's own message lock. That
++ * is the "caller dies holding the lock" case the fixed driver must handle.
++ */
++
++#ifndef IPTS_FAULT_H
++#define IPTS_FAULT_H
++
++#include <linux/printk.h>
++#include <linux/sched.h>
++
++#include "mei.h"
++
++#ifdef IPTS_FAULT_INJECT
++
++extern int ipts_fault;
++extern struct ipts_mei *ipts_fault_mei;
++extern struct task_struct *ipts_fault3_holder;
++
++/*
++ * Called by ipts_mei_search() with the message lock held. Returns true if the
++ * caller must return with the lock still held.
++ */
++static inline bool ipts_fault_hold_message_lock(struct ipts_mei *mei)
++{
++	if (READ_ONCE(ipts_fault3_holder) != current)
++		return false;
++
++	pr_emerg("ipts: FAULT INJECTION 3: %s exits holding the message lock\n",
++		 current->comm);
++	return true;
++}
++
++#else
++
++static inline bool ipts_fault_hold_message_lock(struct ipts_mei *mei)
++{
++	return false;
++}
++
++#endif /* IPTS_FAULT_INJECT */
++
++#endif /* IPTS_FAULT_H */
+diff --git a/mei.c b/mei.c
+index 073b0db..f04e496 100644
+--- a/mei.c
++++ b/mei.c
+@@ -19,6 +19,7 @@
+ #include <linux/wait.h>
+ 
+ #include "context.h"
++#include "fault.h"
+ #include "mei.h"
+ 
+ /*
+@@ -147,6 +148,9 @@ static int ipts_mei_search(struct ipts_mei *mei, enum ipts_command_code code,
+ 	if (!ipts_mei_lock(mei))
+ 		return READ_ONCE(mei->lock_lost) ? -EDEADLK : -EAGAIN;
+ 
++	if (ipts_fault_hold_message_lock(mei))
++		return -EIO;
++
+ 	list_for_each_entry(entry, &mei->messages, list) {
+ 		if (entry->rsp.cmd == code) {
+ 			found = entry;
+@@ -270,5 +274,9 @@ int ipts_mei_init(struct ipts_mei *mei, struct mei_cl_device *cldev)
+ 	init_waitqueue_head(&mei->message_queue);
+ 	init_rwsem(&mei->message_lock);
+ 
++#ifdef IPTS_FAULT_INJECT
++	WRITE_ONCE(ipts_fault_mei, mei);
++#endif
++
+ 	return mei_cldev_register_rx_cb(cldev, ipts_mei_incoming);
+ }
