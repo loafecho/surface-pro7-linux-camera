@@ -1,0 +1,46 @@
+Subject: [PATCH 1/2] media: ipu6: IPU4P: hold CPU latency at 100 us while the
+ ISYS is powered
+
+On the Surface Pro 7 (Ice Lake, C2 exit latency 253 us) the IR camera
+stalls after a frame or two when the CPU may enter C2 during streaming
+(ISYS_PM_QOS_VALUE 300 us allows it): 0 of 10 starts delivered frames.
+With 200 us or less every start streams (100/100 frames, 10/10 starts).
+The request only applies while the ISYS is runtime-resumed.
+
+Assisted-by: LLM
+---
+ drivers/media/pci/intel/ipu6/ipu6-isys.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/pci/intel/ipu6/ipu6-isys.c b/drivers/media/pci/intel/ipu6/ipu6-isys.c
+index 12498748c..b1517163d 100644
+--- a/drivers/media/pci/intel/ipu6/ipu6-isys.c
++++ b/drivers/media/pci/intel/ipu6/ipu6-isys.c
+@@ -103,6 +103,13 @@ enum ltr_did_type {
+ };
+ 
+ #define ISYS_PM_QOS_VALUE	300
++/*
++ * IPU4P loses CSI-2 data when the CPU package sleeps deeper than C1 while
++ * streaming: on the Surface Pro 7 (C2 exit latency 253 us) the IR camera
++ * stalls after a frame or two at 300 us, and streams every time at 200 us
++ * or less.
++ */
++#define IPU4P_ISYS_PM_QOS_VALUE	100
+ 
+ static int
+ ipu6_isys_csi2_fw_port_to_index(struct ipu6_isys *isys, unsigned int fw_port)
+@@ -888,7 +895,9 @@ static int isys_runtime_pm_resume(struct device *dev)
+ 	if (ret)
+ 		return ret;
+ 
+-	cpu_latency_qos_update_request(&isys->pm_qos, ISYS_PM_QOS_VALUE);
++	cpu_latency_qos_update_request(&isys->pm_qos, IS_IPU4P(isp) ?
++				       IPU4P_ISYS_PM_QOS_VALUE :
++				       ISYS_PM_QOS_VALUE);
+ 
+ 	ret = ipu6_buttress_start_tsc_sync(isp);
+ 	if (ret)
+-- 
+2.43.0
+

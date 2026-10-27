@@ -1,0 +1,47 @@
+Subject: [PATCH 2/2] media: ipu6: IPU4P: update the iwake watermark after the
+ stream is off
+
+The watermark update reaches IPU4P firmware through the proxy queue. Sent
+before the stream flush while a large frame is being written (Surface Pro
+7 front camera at full resolution), it stalls that frame: the flush and
+close are never acknowledged and both time out (2 s each, every stop).
+Updating it after set_streaming(0) gives clean stops (0 timeouts in 12).
+
+Assisted-by: LLM
+---
+ drivers/media/pci/intel/ipu6/ipu6-isys-queue.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/pci/intel/ipu6/ipu6-isys-queue.c b/drivers/media/pci/intel/ipu6/ipu6-isys-queue.c
+index 38db162d6..c1611ed45 100644
+--- a/drivers/media/pci/intel/ipu6/ipu6-isys-queue.c
++++ b/drivers/media/pci/intel/ipu6/ipu6-isys-queue.c
+@@ -582,7 +582,14 @@ static void stop_streaming(struct vb2_queue *q)
+ 
+ 	mutex_lock(&stream->mutex);
+ 
+-	ipu6_isys_update_stream_watermark(av, false);
++	/*
++	 * IPU4P: the watermark update goes to the firmware through the proxy
++	 * queue. Sent while a large frame is still being written (the Surface
++	 * Pro 7 front camera at full resolution) it stalls that frame, so the
++	 * stream flush is never acknowledged. Update it once the stream is off.
++	 */
++	if (!IS_IPU4P(av->isys->adev->isp))
++		ipu6_isys_update_stream_watermark(av, false);
+ 
+ 	mutex_lock(&av->isys->stream_mutex);
+ 	if (stream->nr_streaming == stream->nr_queues && stream->streaming)
+@@ -590,6 +597,9 @@ static void stop_streaming(struct vb2_queue *q)
+ 	list_del(&aq->node);
+ 	mutex_unlock(&av->isys->stream_mutex);
+ 
++	if (IS_IPU4P(av->isys->adev->isp))
++		ipu6_isys_update_stream_watermark(av, false);
++
+ 	stream->nr_streaming--;
+ 	stream->streaming = 0;
+ 	mutex_unlock(&stream->mutex);
+-- 
+2.43.0
+
