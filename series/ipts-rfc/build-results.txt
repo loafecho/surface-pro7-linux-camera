@@ -1,0 +1,7 @@
+# make -C <7.3 kernel tree> M=<dir> 2>&1 | grep -ci warning, per prefix (2026-10-27T05:02:01Z)
+BUILD base commit=d000297 rc=0 warnings=0 srcversion=9BECACED8E1DD82F4AC3F37
+BUILD s1 commit=c3f6ada rc=0 warnings=0 srcversion=F510A3A9942AE87EDDB5A78
+BUILD s2 commit=68a3795 rc=0 warnings=0 srcversion=B1F111A44FE3C138491743D
+BUILD pr178 commit=49d4164 rc=0 warnings=0 srcversion=87DF05B44AD69A933FE7E34
+BUILD o2 commit=e3440fc rc=0 warnings=0 srcversion=B1F111A44FE3C138491743D
+# base = v7.2-surface-devel ipts; s1 = +0001; s2 = +0001+0002; pr178 = base + PR #178; o2 = pr178 + on-pr178/0001

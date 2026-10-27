@@ -1,0 +1,121 @@
+From 68a37954b0237b3fa4008d4b4bcb42094f079899 Mon Sep 17 00:00:00 2001
+From: Tony Garcia <180770769+loafecho@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 05:01:50 +0000
+Subject: [RFC PATCH 0/2] hid: ipts: fix a list race and bound the stop path (Surface Pro 7)
+
+These two patches fix two touchscreen driver (ipts) faults seen on a
+Surface Pro 7 (EDS2, poll mode). They apply to drivers/hid/ipts of
+linux-surface/kernel v7.2-surface-devel (2dfd333c3af7) and, unchanged,
+v7.3-surface-devel (87cf7d2e0ca7); drivers/hid/ipts is the same on both.
+
+Status: RFC. Patch 1 is the same fix as linux-surface/kernel PR #178, so
+it is here for reference only; the plan is to support #178 there rather
+than open a duplicate. Patch 2 is not ready to merge: a review found a
+use-after-free on its "message lock lost" path (see Known issues), and
+its rework is not done.
+
+1/2 hid: ipts: find and unlink a reply under one lock
+    ipts_mei_search() found a reply under the read lock and deleted it
+    under a second, separately taken write lock. Two waiters could take
+    the same entry, and the second list_del() faulted
+    (0xdead000000000108, RIP ipts_mei_search).
+
+2/2 hid: ipts: bound the stop path and never unload with a live HID
+    device
+    ipts_thread_stop() waited with no timeout, so after the oops above
+    every later stop hung. Reboot, power-off and rmmod hangs were
+    captured (reboot stack from pstore: device_shutdown >
+    pci_device_shutdown > mei_me_shutdown > mei_stop > ... >
+    ipts_remove > ... > ipts_thread_stop > wait_for_completion);
+    suspend takes the same path and is expected to hang, but that was
+    not observed. A failed stop handshake also skipped
+    ipts_hid_free(), so the module could unload with its HID device
+    still registered.
+
+What was tested (Surface Pro 7, kernel 6.19.8, code identical to these
+two patches plus a test-only fault-injection patch that is compiled out
+by default; evidence files named in brackets):
+- Before the fix: the stock driver faulted in the first start-up race
+  cycle in 4 of 4 runs [R2/red-summary.txt], and a plain reboot after
+  that fault hung in ipts_thread_stop() [R1/verdict.txt].
+- Start-up race (ipts-race.sh, 4 processes sending HID requests while
+  the driver loads): 200/200 cycles, 0 kernel errors
+  [R2/green-summary.txt].
+- Unload with a failed stop handshake (fault injection, 4 processes
+  using the hidraw node): 200 cycles, HID device gone after every
+  unload, 0 kernel errors; 2 runs ended in a firmware stall (the device
+  stops answering until a reboot) [R3/green-summary.txt].
+- Receiver thread killed while holding message_lock, and a userspace
+  request keeping it: sleep completes, reboot back in 32-40 s, 0 new
+  kernel errors, 3 runs each [R4/thread-summary.txt,
+  R4/caller-summary.txt].
+- 50/50 suspend/resume cycles, one 61-minute sleep, 0 new kernel
+  errors [R6/summary.txt]; 10/10 normal restarts back in 90 s or less
+  [R7/restarts.txt].
+- The bracketed evidence files are local test records, available on
+  request.
+- Patch 1 alone was also run as the installed driver from 2026-10-04;
+  it builds to the same srcversion as that module (F510A3A9942A...).
+- A 7.3.0-rc7 kernel built with these two patches (its in-tree ipts
+  module reports srcversion D2A20EFC6712...; external-module builds of
+  the same source report B1F111A44FE3...) has been the default kernel
+  since 2026-10-19. On its
+  first checked boot ipts loaded, iptsd was running and no Oops or BUG
+  line was logged. None of the runs above were repeated on 7.3.
+- Both patches were rebased onto v7.2-surface-devel with no conflicts;
+  every prefix builds as an external module with 0 warnings, and
+  checkpatch.pl --strict reports only the missing Signed-off-by.
+
+What was not tested:
+- EDS1 devices (no hardware). Patch 2 moves the EDS1 mode-switch restart
+  into a work item; the EDS1 files themselves are unchanged.
+- Any device other than one Surface Pro 7.
+- A lock holder that stays alive and stuck (see Known issues).
+- Patch 2 does not apply on top of #178 as is (conflict in mei.c). A
+  version rebased onto #178, with the conflict resolved, gives a tree
+  byte-identical to this series; it was built but not run.
+
+Known issues:
+- Patch 2, use-after-free: once message_lock is declared lost (three
+  1 s timeouts with the same holder), ipts_control_stop() returns
+  -EDEADLK and ipts_remove() frees the context. A holder that is stuck
+  but still alive later calls up_write() on freed memory.
+- Patch 2 pins the module with try_module_get() and loops forever in
+  remove if the module is already going away; reviewers are likely to
+  reject that, and the planned rework drops it.
+- After heavy unload/reload churn the IPTS firmware can stop answering
+  until the next reboot (about 1 in 110-140 reloads under stress). It
+  was first seen without patch 2, on a driver with only patch 1 (cycle
+  4 of an unload/open run). Before that, 100 cycles of the same race on
+  that driver showed no stall (raw logs not kept), which is not enough
+  data to call it a difference.
+
+AI disclosure: an AI coding assistant (Claude Code, an LLM) did most of
+the work: finding both bugs from crash records and the source, writing
+both patches and these messages, and running the tests on the device.
+Only the human submitter adds a Signed-off-by, after reviewing both
+patches. Both patches carry "Assisted-by: LLM". No specialized analysis
+tools (sparse, smatch, coccinelle) were used; checkpatch.pl was run.
+
+Tony Garcia (2):
+  hid: ipts: find and unlink a reply under one lock
+  hid: ipts: bound the stop path and never unload with a live HID device
+
+ drivers/hid/ipts/cmd.h      |   2 +-
+ drivers/hid/ipts/context.h  |  33 +++++++
+ drivers/hid/ipts/control.c  | 165 ++++++++++++++++++++++++++------
+ drivers/hid/ipts/control.h  |  21 ++++-
+ drivers/hid/ipts/eds2.c     |  10 ++
+ drivers/hid/ipts/hid.c      |  78 +++++++++++++--
+ drivers/hid/ipts/hid.h      |   9 ++
+ drivers/hid/ipts/main.c     |  88 +++++++++++++++--
+ drivers/hid/ipts/mei.c      | 183 +++++++++++++++++++++++++++---------
+ drivers/hid/ipts/mei.h      |  47 ++++++++-
+ drivers/hid/ipts/receiver.c | 111 ++++++++++++----------
+ drivers/hid/ipts/thread.c   |  70 ++++++++++++--
+ drivers/hid/ipts/thread.h   |  26 ++++-
+ 13 files changed, 686 insertions(+), 157 deletions(-)
+
+-- 
+2.43.0
+

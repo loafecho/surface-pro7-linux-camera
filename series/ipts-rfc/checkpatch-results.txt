@@ -1,0 +1,9 @@
+== on-pr178/0001-hid-ipts-bound-the-stop-path-and-never-unload-with-a.patch
+ERROR: Missing Signed-off-by: line(s)
+total: 1 errors, 0 warnings, 0 checks, 1366 lines checked
+== 0001-hid-ipts-find-and-unlink-a-reply-under-one-lock.patch
+ERROR: Missing Signed-off-by: line(s)
+total: 1 errors, 0 warnings, 0 checks, 70 lines checked
+== 0002-hid-ipts-bound-the-stop-path-and-never-unload-with-a.patch
+ERROR: Missing Signed-off-by: line(s)
+total: 1 errors, 0 warnings, 0 checks, 1330 lines checked

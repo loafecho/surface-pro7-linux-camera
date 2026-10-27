@@ -1,0 +1,1575 @@
+From e3440fcf37786fc2de173643860674697818d9de Mon Sep 17 00:00:00 2001
+From: Tony Garcia <180770769+loafecho@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 04:25:15 +0000
+Subject: [RFC PATCH] hid: ipts: bound the stop path and never unload with a
+ live HID device
+
+ipts_remove() runs on rmmod and also on every reboot, power-off and
+suspend (mei_me_shutdown() and mei_me_pci_suspend() both call
+mei_stop(), which removes every ME client device). Its stop path had no
+bound: ipts_thread_stop() waited for the receiver thread with
+wait_for_completion() and no timeout. If the receiver thread died in an
+oops, or slept forever on message_lock held by a task that died, every
+later stop hung: reboot (captured from pstore: device_shutdown >
+pci_device_shutdown > mei_me_shutdown > mei_stop > ... > ipts_remove >
+... > ipts_thread_stop > wait_for_completion), power-off and rmmod.
+Suspend takes the same path through mei_me_pci_suspend() and is
+expected to hang the same way; that was not observed.
+
+In addition, when the receiver thread returned an error from its
+shutdown handshake, _ipts_control_stop() and ipts_control_stop()
+returned early and never called ipts_hid_free(). The module then
+unloaded with its hid_device still registered; the next open or ioctl
+of its hidraw node ran freed module code (BUG: unable to handle page
+fault, RIP hidraw_open+0xd8 or inside __hid_hw_raw_request,
+[last unloaded: ipts]).
+
+Changes:
+- Wait at most 20 s in ipts_thread_stop(). Report a thread that died
+  (PF_EXITING) or is still stuck, and mark the context "wedged": free
+  nothing it can still touch, keep the HID device, leak the context and
+  the MEI device, and pin the module with try_module_get() (if the
+  module is already going away, block remove rather than free code a
+  thread still runs). Log one error line.
+- Pin the task_struct across the stop, and never store a
+  kthread_create() error as a thread.
+- Never wait for message_lock forever: take it in trylock loops bounded
+  at 1 s, and declare it lost after three timeouts with the same
+  holder. Sleep in ipts_mei_recv() on a sequence counter instead of
+  taking the lock inside the wait_event() condition. Send with
+  mei_cldev_send_timeout(), and don't retry on -EINTR (the message is
+  already queued).
+- Count HID callbacks; when stopping, wait at most 10 s for them and
+  release a pending GET_FEATURE at once. Treat a callback that never
+  returns (its task died inside hidraw_ioctl() holding the HID core's
+  minors_rwsem) as wedged, because hid_destroy_device() would block
+  forever on that lock.
+- Run ipts_hid_free() on every other path, including a failed stop
+  handshake. If the device never confirmed the stop, or was never told
+  to stop, leak its DMA buffers instead of freeing them.
+- Unwind everything probe and start set up on error, stopping the
+  receiver before freeing anything it uses.
+- Run the EDS1 mode-switch restart from a work item serialized with
+  remove (disable_work_sync()), never inside the HID callback.
+- Check should_stop inside the receiver's inner loops, and never let
+  the poll loop walk more than IPTS_BUFFERS behind the doorbell.
+- On every stop, wait up to 3 s for the QUIESCE_IO confirmation, even
+  if the last READY_FOR_DATA reply was lost; starting the device again
+  before it stopped can leave its firmware unresponsive until the next
+  boot.
+- Remove the dead "timeout < 0" branch on a u64.
+
+Tested on a Surface Pro 7 (EDS2, poll mode), kernel 6.19.8, with this
+code plus a test-only fault-injection patch that is compiled out by
+default: reboot with a crashed driver, driver unload during HID requests
+(ipts-unload-race.sh), start-up race (ipts-race.sh), fault injection
+(receiver thread or a caller dying while holding message_lock; a failed
+stop handshake). Reboot with the driver crashed no longer hangs; 200/200
+start-up race cycles, 0 oops; 200 unload cycles with a failed handshake,
+0 oops, plus 2 firmware stalls (the device stops answering until the
+next reboot); with the receiver thread killed or the lock held, sleep
+still completes and reboot returns in 32-40 s.
+
+Known issue, found in review and not fixed here: once message_lock is
+declared lost, ipts_control_stop() returns -EDEADLK and ipts_remove()
+frees the context. A lock holder that is stuck but still alive will
+later call up_write() on that freed memory. Only the dead-holder case
+was tested (fault injection above).
+
+Fixes: 8e40dfbbf0da ("hid: Add support for Intel Precise Touch and Stylus")
+Assisted-by: LLM
+Patchset: ipts
+---
+ drivers/hid/ipts/cmd.h      |   2 +-
+ drivers/hid/ipts/context.h  |  33 +++++++
+ drivers/hid/ipts/control.c  | 165 ++++++++++++++++++++++++++------
+ drivers/hid/ipts/control.h  |  21 +++-
+ drivers/hid/ipts/eds2.c     |  10 ++
+ drivers/hid/ipts/hid.c      |  78 +++++++++++++--
+ drivers/hid/ipts/hid.h      |   9 ++
+ drivers/hid/ipts/main.c     |  88 +++++++++++++++--
+ drivers/hid/ipts/mei.c      | 184 +++++++++++++++++++++++++++---------
+ drivers/hid/ipts/mei.h      |  47 ++++++++-
+ drivers/hid/ipts/receiver.c | 111 ++++++++++++----------
+ drivers/hid/ipts/thread.c   |  70 ++++++++++++--
+ drivers/hid/ipts/thread.h   |  26 ++++-
+ 13 files changed, 689 insertions(+), 155 deletions(-)
+
+diff --git a/drivers/hid/ipts/cmd.h b/drivers/hid/ipts/cmd.h
+index 2b40790..84cf827 100644
+--- a/drivers/hid/ipts/cmd.h
++++ b/drivers/hid/ipts/cmd.h
+@@ -25,7 +25,7 @@
+  * @rsp: The address that the received response will be copied to.
+  * @timeout: How many milliseconds the function will wait at most.
+  *
+- * A negative timeout means to wait forever.
++ * A timeout of 0 means to check once and return.
+  *
+  * Returns: 0 on success, <0 on error, -EAGAIN if no response has been received.
+  */
+diff --git a/drivers/hid/ipts/context.h b/drivers/hid/ipts/context.h
+index ba33259..1e5d518 100644
+--- a/drivers/hid/ipts/context.h
++++ b/drivers/hid/ipts/context.h
+@@ -8,6 +8,7 @@
+ #ifndef IPTS_CONTEXT_H
+ #define IPTS_CONTEXT_H
+ 
++#include <linux/atomic.h>
+ #include <linux/completion.h>
+ #include <linux/device.h>
+ #include <linux/hid.h>
+@@ -15,6 +16,8 @@
+ #include <linux/mutex.h>
+ #include <linux/sched.h>
+ #include <linux/types.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
+ 
+ #include "mei.h"
+ #include "resources.h"
+@@ -43,6 +46,36 @@ struct ipts_context {
+ 	bool hid_active;
+ 	struct hid_device *hid;
+ 
++	/*
++	 * Number of HID callbacks (requests from userspace) currently running
++	 * driver code. Stopping waits, bounded, for this to drop to 0.
++	 */
++	atomic_t hid_users;
++	wait_queue_head_t hid_users_wq;
++
++	/*
++	 * Serializes start/stop/restart. Restarts requested from a HID callback
++	 * (EDS1 mode switch) run from restart_work, never inside the callback.
++	 */
++	struct mutex ctl_lock;
++	struct work_struct restart_work;
++	bool removing;
++
++	/*
++	 * Set when stopping could not finish: the receiver thread is alive but
++	 * stuck (wedged), or a HID callback never returned (callers_stuck, its
++	 * task most likely died holding HID core locks). Nothing they can still
++	 * touch is freed, and the HID device is not destroyed.
++	 */
++	bool wedged;
++	bool callers_stuck;
++
++	/*
++	 * The receiver thread died without telling the device to stop, so the
++	 * device may still write to the data buffers: they are never freed.
++	 */
++	bool leak_buffers;
++
+ 	struct ipts_device_info info;
+ 	struct ipts_resources resources;
+ 
+diff --git a/drivers/hid/ipts/control.c b/drivers/hid/ipts/control.c
+index 5360842..ca7c536 100644
+--- a/drivers/hid/ipts/control.c
++++ b/drivers/hid/ipts/control.c
+@@ -210,7 +210,7 @@ int ipts_control_wait_flush(struct ipts_context *ipts)
+ 
+ 	ret = ipts_cmd_recv(ipts, IPTS_CMD_QUIESCE_IO, &rsp);
+ 	if (ret) {
+-		dev_err(ipts->dev, "QUIESCE_IO: recv failed: %d\n", ret);
++		dev_err_ratelimited(ipts->dev, "QUIESCE_IO: recv failed: %d\n", ret);
+ 		return ret;
+ 	}
+ 
+@@ -218,7 +218,7 @@ int ipts_control_wait_flush(struct ipts_context *ipts)
+ 		return -EAGAIN;
+ 
+ 	if (rsp.status != IPTS_STATUS_SUCCESS) {
+-		dev_err(ipts->dev, "QUIESCE_IO: cmd failed: %d\n", rsp.status);
++		dev_err_ratelimited(ipts->dev, "QUIESCE_IO: cmd failed: %d\n", rsp.status);
+ 		return -EBADR;
+ 	}
+ 
+@@ -234,7 +234,7 @@ int ipts_control_request_data(struct ipts_context *ipts)
+ 
+ 	ret = ipts_cmd_send(ipts, IPTS_CMD_READY_FOR_DATA, NULL, 0);
+ 	if (ret)
+-		dev_err(ipts->dev, "READY_FOR_DATA: send failed: %d\n", ret);
++		dev_err_ratelimited(ipts->dev, "READY_FOR_DATA: send failed: %d\n", ret);
+ 
+ 	return ret;
+ }
+@@ -254,7 +254,7 @@ int ipts_control_wait_data(struct ipts_context *ipts, bool shutdown)
+ 
+ 	if (ret) {
+ 		if (ret != -EAGAIN)
+-			dev_err(ipts->dev, "READY_FOR_DATA: recv failed: %d\n", ret);
++			dev_err_ratelimited(ipts->dev, "READY_FOR_DATA: recv failed: %d\n", ret);
+ 
+ 		return ret;
+ 	}
+@@ -269,7 +269,7 @@ int ipts_control_wait_data(struct ipts_context *ipts, bool shutdown)
+ 		return -EAGAIN;
+ 
+ 	if (rsp.status != IPTS_STATUS_SUCCESS) {
+-		dev_err(ipts->dev, "READY_FOR_DATA: cmd failed: %d\n", rsp.status);
++		dev_err_ratelimited(ipts->dev, "READY_FOR_DATA: cmd failed: %d\n", rsp.status);
+ 		return -EBADR;
+ 	}
+ 
+@@ -289,13 +289,13 @@ int ipts_control_send_feedback(struct ipts_context *ipts, u32 buffer)
+ 
+ 	ret = ipts_cmd_send(ipts, IPTS_CMD_FEEDBACK, &cmd, sizeof(cmd));
+ 	if (ret) {
+-		dev_err(ipts->dev, "FEEDBACK: send failed: %d\n", ret);
++		dev_err_ratelimited(ipts->dev, "FEEDBACK: send failed: %d\n", ret);
+ 		return ret;
+ 	}
+ 
+ 	ret = ipts_cmd_recv(ipts, IPTS_CMD_FEEDBACK, &rsp);
+ 	if (ret) {
+-		dev_err(ipts->dev, "FEEDBACK: recv failed: %d\n", ret);
++		dev_err_ratelimited(ipts->dev, "FEEDBACK: recv failed: %d\n", ret);
+ 		return ret;
+ 	}
+ 
+@@ -307,7 +307,7 @@ int ipts_control_send_feedback(struct ipts_context *ipts, u32 buffer)
+ 		return 0;
+ 
+ 	if (rsp.status != IPTS_STATUS_SUCCESS) {
+-		dev_err(ipts->dev, "FEEDBACK: cmd failed: %d\n", rsp.status);
++		dev_err_ratelimited(ipts->dev, "FEEDBACK: cmd failed: %d\n", rsp.status);
+ 		return -EBADR;
+ 	}
+ 
+@@ -379,7 +379,7 @@ int ipts_control_start(struct ipts_context *ipts)
+ 		ret = ipts_control_get_descriptor(ipts);
+ 		if (ret) {
+ 			dev_err(ipts->dev, "Failed to fetch HID descriptor: %d\n", ret);
+-			return ret;
++			goto err_free_resources;
+ 		}
+ 
+ 		/*
+@@ -391,25 +391,25 @@ int ipts_control_start(struct ipts_context *ipts)
+ 	ret = ipts_control_set_mode(ipts, ipts->mode);
+ 	if (ret) {
+ 		dev_err(ipts->dev, "Failed to set mode: %d\n", ret);
+-		return ret;
++		goto err_free_resources;
+ 	}
+ 
+ 	ret = ipts_control_set_mem_window(ipts, &ipts->resources);
+ 	if (ret) {
+ 		dev_err(ipts->dev, "Failed to set memory window: %d\n", ret);
+-		return ret;
++		goto err_leak_resources;
+ 	}
+ 
+ 	ret = ipts_receiver_start(ipts);
+ 	if (ret) {
+ 		dev_err(ipts->dev, "Failed to start receiver: %d\n", ret);
+-		return ret;
++		goto err_leak_resources;
+ 	}
+ 
+ 	ret = ipts_control_request_data(ipts);
+ 	if (ret) {
+ 		dev_err(ipts->dev, "Failed to request data: %d\n", ret);
+-		return ret;
++		goto err_stop;
+ 	}
+ 
+ 	ipts_hid_enable(ipts);
+@@ -417,12 +417,41 @@ int ipts_control_start(struct ipts_context *ipts)
+ 	ret = ipts_hid_init(ipts, info);
+ 	if (ret) {
+ 		dev_err(ipts->dev, "Failed to initialize HID device: %d\n", ret);
+-		return ret;
++		goto err_stop;
+ 	}
+ 
+ 	return 0;
++
++err_stop:
++	/*
++	 * The receiver is running: stop it before anything it uses goes away.
++	 * If it cannot be stopped, report that instead of the original error.
++	 */
++	if (ipts_control_stop(ipts) == -ETIMEDOUT)
++		return -ETIMEDOUT;
++
++	return ret;
++
++err_leak_resources:
++	/*
++	 * The device may already have been given these buffers and was never
++	 * told to stop, so they are never freed.
++	 */
++	dev_err(ipts->dev, "Leaking DMA buffers after a failed start\n");
++	memset(&ipts->resources, 0, sizeof(ipts->resources));
++	return ret;
++
++err_free_resources:
++	ipts_resources_free(&ipts->resources);
++	return ret;
+ }
+ 
++/*
++ * How long stopping waits for running HID callbacks. The longest one is a
++ * GET_FEATURE request (5 s), which ipts_hid_quiesce() also cuts short.
++ */
++#define IPTS_HID_QUIESCE_TIMEOUT_MS 10000
++
+ static int _ipts_control_stop(struct ipts_context *ipts)
+ {
+ 	int ret = 0;
+@@ -430,20 +459,59 @@ static int _ipts_control_stop(struct ipts_context *ipts)
+ 	if (!ipts)
+ 		return -EFAULT;
+ 
+-	ipts_hid_disable(ipts);
+ 	dev_info(ipts->dev, "Stopping IPTS\n");
+ 
++	if (!ipts->callers_stuck && ipts_hid_quiesce(ipts, IPTS_HID_QUIESCE_TIMEOUT_MS)) {
++		ipts->callers_stuck = true;
++		dev_err(ipts->dev, "A HID request never returned (%d still running)\n",
++			atomic_read(&ipts->hid_users));
++	}
++
+ 	ret = ipts_receiver_stop(ipts);
+-	if (ret) {
++	if (ret == -EOWNERDEAD) {
++		/*
++		 * It may have died inside HID or input core holding their locks,
++		 * so the HID device cannot be destroyed safely either.
++		 */
++		ipts->wedged = true;
++		dev_err(ipts->dev, "Receiver thread died without stopping\n");
++	} else if (ret == -ETIMEDOUT) {
++		ipts->wedged = true;
++		dev_err(ipts->dev, "Receiver thread did not stop within %d ms\n",
++			IPTS_THREAD_STOP_TIMEOUT_MS);
++	} else if (ret) {
+ 		dev_err(ipts->dev, "Failed to stop receiver: %d\n", ret);
+-		return ret;
++	} else if (ipts->receiver_loop.exit_code && !ipts->leak_buffers) {
++		ipts->leak_buffers = true;
++		dev_err(ipts->dev, "Device did not confirm the stop (%d), leaking its DMA buffers\n",
++			ipts->receiver_loop.exit_code);
++	}
++
++	/*
++	 * Never free buffers that a stuck thread or a stuck HID request can
++	 * still read or write. They are leaked on purpose.
++	 */
++	if (ipts->wedged || ipts->callers_stuck)
++		return -ETIMEDOUT;
++
++	/*
++	 * Without the message lock the flush handshake could not be confirmed,
++	 * so the device may still be writing to the buffers.
++	 */
++	if (READ_ONCE(ipts->mei.lock_lost) && !ipts->leak_buffers) {
++		ipts->leak_buffers = true;
++		dev_err(ipts->dev, "Device stop not confirmed, leaking its DMA buffers\n");
++	}
++
++	if (ipts->leak_buffers) {
++		memset(&ipts->resources, 0, sizeof(ipts->resources));
++		ipts->leak_buffers = false;
++		return 0;
+ 	}
+ 
+ 	ret = ipts_resources_free(&ipts->resources);
+-	if (ret) {
++	if (ret)
+ 		dev_err(ipts->dev, "Failed to free resources: %d\n", ret);
+-		return ret;
+-	}
+ 
+ 	return 0;
+ }
+@@ -452,26 +520,42 @@ int ipts_control_stop(struct ipts_context *ipts)
+ {
+ 	int ret = 0;
+ 
++	if (!ipts)
++		return -EFAULT;
++
+ 	ret = _ipts_control_stop(ipts);
+-	if (ret)
++
++	/*
++	 * The HID device must be gone before the module can unload, on every
++	 * path, or opening its hidraw node later runs freed module code. The
++	 * only exception is a stuck HID request or thread: then destroying the
++	 * device could block forever on locks held by the stuck task, or free
++	 * memory it still uses, and the module is pinned instead (see
++	 * ipts_remove()).
++	 */
++	if (ret == -ETIMEDOUT)
+ 		return ret;
+ 
+ 	ret = ipts_hid_free(ipts);
+-	if (ret) {
++	if (ret)
+ 		dev_err(ipts->dev, "Failed to free HID device: %d\n", ret);
+-		return ret;
+-	}
+ 
+ 	return 0;
+ }
+ 
+-int ipts_control_restart(struct ipts_context *ipts)
++static void ipts_control_restart_work(struct work_struct *work)
+ {
+ 	int ret = 0;
++	struct ipts_context *ipts = container_of(work, struct ipts_context, restart_work);
++
++	mutex_lock(&ipts->ctl_lock);
++
++	if (READ_ONCE(ipts->removing) || ipts->wedged || ipts->callers_stuck)
++		goto out;
+ 
+ 	ret = _ipts_control_stop(ipts);
+-	if (ret)
+-		return ret;
++	if (ret || READ_ONCE(ipts->mei.lock_lost) || READ_ONCE(ipts->removing))
++		goto out;
+ 
+ 	/*
+ 	 * Wait a second to give the sensor time to fully shut down.
+@@ -480,7 +564,32 @@ int ipts_control_restart(struct ipts_context *ipts)
+ 
+ 	ret = ipts_control_start(ipts);
+ 	if (ret)
+-		return ret;
++		dev_err(ipts->dev, "Failed to restart IPTS: %d\n", ret);
++
++out:
++	mutex_unlock(&ipts->ctl_lock);
++}
++
++void ipts_control_init(struct ipts_context *ipts)
++{
++	mutex_init(&ipts->ctl_lock);
++	INIT_WORK(&ipts->restart_work, ipts_control_restart_work);
++	atomic_set(&ipts->hid_users, 0);
++	init_waitqueue_head(&ipts->hid_users_wq);
++}
++
++int ipts_control_restart(struct ipts_context *ipts)
++{
++	if (!ipts)
++		return -EFAULT;
++
++	/*
++	 * Called from a HID callback, which stopping waits for, so the restart
++	 * itself runs from a work item, serialized with remove.
++	 */
++	if (READ_ONCE(ipts->removing))
++		return -ENODEV;
+ 
++	schedule_work(&ipts->restart_work);
+ 	return 0;
+ }
+diff --git a/drivers/hid/ipts/control.h b/drivers/hid/ipts/control.h
+index 26629c5..e17de01 100644
+--- a/drivers/hid/ipts/control.h
++++ b/drivers/hid/ipts/control.h
+@@ -103,7 +103,10 @@ static inline int ipts_control_refill_buffer(struct ipts_context *ipts, u32 buff
+  * ipts_control_start() - Initialized the device and starts the data flow.
+  * @ipts: The IPTS driver context.
+  *
+- * Returns: 0 on success, <0 on error.
++ * On failure everything it set up is torn down again.
++ *
++ * Returns: 0 on success, -ETIMEDOUT if the teardown left the context wedged,
++ * <0 on other errors.
+  */
+ int ipts_control_start(struct ipts_context *ipts);
+ 
+@@ -111,16 +114,26 @@ int ipts_control_start(struct ipts_context *ipts);
+  * ipts_control_stop() - Stops the data flow and resets the device.
+  * @ipts: The IPTS driver context.
+  *
+- * Returns: 0 on success, <0 on error.
++ * Bounded in time. Destroys the HID device and frees all buffers, unless the
++ * receiver thread or a HID request is stuck: then nothing is freed.
++ *
++ * Returns: 0 when stopped, -ETIMEDOUT when stuck (the context must be leaked
++ * and the module kept loaded), <0 on invalid arguments.
+  */
+ int ipts_control_stop(struct ipts_context *ipts);
+ 
+ /**
+- * ipts_control_restart() - Stops the device and starts it again.
++ * ipts_control_restart() - Schedules a stop and start of the device.
+  * @ipts: The IPTS driver context.
+  *
+- * Returns: 0 on success, <0 on error.
++ * Returns: 0 if the restart was scheduled, <0 on error.
+  */
+ int ipts_control_restart(struct ipts_context *ipts);
+ 
++/**
++ * ipts_control_init() - Initializes the locks and work items of the context.
++ * @ipts: The IPTS driver context.
++ */
++void ipts_control_init(struct ipts_context *ipts);
++
+ #endif /* IPTS_CONTROL_H */
+diff --git a/drivers/hid/ipts/eds2.c b/drivers/hid/ipts/eds2.c
+index 6399407..15435d4 100644
+--- a/drivers/hid/ipts/eds2.c
++++ b/drivers/hid/ipts/eds2.c
+@@ -67,6 +67,16 @@ static int ipts_eds2_get_feature(struct ipts_context *ipts, u8 *buffer, size_t s
+ 	memset(&ipts->feature_report, 0, sizeof(ipts->feature_report));
+ 	reinit_completion(&ipts->feature_event);
+ 
++	/*
++	 * A stop that started before the reinit above already released the
++	 * completion; do not wait 5 s for a reply that will not come.
++	 */
++	smp_mb();
++	if (!READ_ONCE(ipts->hid_active)) {
++		ret = -ENODEV;
++		goto out;
++	}
++
+ 	ret = ipts_control_hid2me_feedback(ipts, IPTS_FEEDBACK_CMD_TYPE_NONE, type, buffer, size);
+ 	if (ret) {
+ 		dev_err(ipts->dev, "Failed to send hid2me feedback: %d\n", ret);
+diff --git a/drivers/hid/ipts/hid.c b/drivers/hid/ipts/hid.c
+index e34a1a4..a3e1dd9 100644
+--- a/drivers/hid/ipts/hid.c
++++ b/drivers/hid/ipts/hid.c
+@@ -31,6 +31,56 @@ void ipts_hid_disable(struct ipts_context *ipts)
+ 	WRITE_ONCE(ipts->hid_active, false);
+ }
+ 
++static void ipts_hid_exit(struct ipts_context *ipts)
++{
++	if (atomic_dec_and_test(&ipts->hid_users))
++		wake_up_all(&ipts->hid_users_wq);
++}
++
++/*
++ * Every HID callback that runs driver code is counted, so that stopping can
++ * wait until none of them can touch the buffers it is about to free.
++ */
++static bool ipts_hid_enter(struct ipts_context *ipts)
++{
++	atomic_inc(&ipts->hid_users);
++
++	/*
++	 * Pairs with the smp_mb() in ipts_hid_quiesce(): either quiesce sees
++	 * this caller in hid_users, or this caller sees hid_active cleared.
++	 */
++	smp_mb__after_atomic();
++
++	if (!READ_ONCE(ipts->hid_active)) {
++		ipts_hid_exit(ipts);
++		return false;
++	}
++
++	return true;
++}
++
++int ipts_hid_quiesce(struct ipts_context *ipts, unsigned int timeout_ms)
++{
++	ipts_hid_disable(ipts);
++
++	/*
++	 * Order clearing hid_active before reading hid_users. Pairs with the
++	 * smp_mb__after_atomic() in ipts_hid_enter().
++	 */
++	smp_mb();
++
++	/*
++	 * Release a GET_FEATURE request waiting for a reply that will not come.
++	 */
++	complete_all(&ipts->feature_event);
++
++	if (!wait_event_timeout(ipts->hid_users_wq, atomic_read(&ipts->hid_users) == 0,
++				msecs_to_jiffies(timeout_ms)))
++		return -ETIMEDOUT;
++
++	return 0;
++}
++
+ static int ipts_hid_start(struct hid_device *hid)
+ {
+ 	return 0;
+@@ -56,7 +106,7 @@ static int ipts_hid_parse(struct hid_device *hid)
+ 	if (!ipts)
+ 		return -EFAULT;
+ 
+-	if (!READ_ONCE(ipts->hid_active))
++	if (!ipts_hid_enter(ipts))
+ 		return -ENODEV;
+ 
+ 	if (ipts->info.intf_eds == 1)
+@@ -64,6 +114,8 @@ static int ipts_hid_parse(struct hid_device *hid)
+ 	else
+ 		ret = ipts_eds2_get_descriptor(ipts, &buffer, &size);
+ 
++	ipts_hid_exit(ipts);
++
+ 	if (ret) {
+ 		dev_err(ipts->dev, "Failed to allocate HID descriptor: %d\n", ret);
+ 		return ret;
+@@ -83,6 +135,7 @@ static int ipts_hid_parse(struct hid_device *hid)
+ static int ipts_hid_raw_request(struct hid_device *hid, unsigned char report_id, __u8 *buffer,
+ 				size_t size, unsigned char report_type, int request_type)
+ {
++	int ret = 0;
+ 	struct ipts_context *ipts = NULL;
+ 
+ 	if (!hid)
+@@ -93,16 +146,19 @@ static int ipts_hid_raw_request(struct hid_device *hid, unsigned char report_id,
+ 	if (!ipts)
+ 		return -EFAULT;
+ 
+-	if (!READ_ONCE(ipts->hid_active))
++	if (!ipts_hid_enter(ipts))
+ 		return -ENODEV;
+ 
+ 	if (ipts->info.intf_eds == 1) {
+-		return ipts_eds1_raw_request(ipts, buffer, size, report_id, report_type,
+-					     request_type);
++		ret = ipts_eds1_raw_request(ipts, buffer, size, report_id, report_type,
++					    request_type);
+ 	} else {
+-		return ipts_eds2_raw_request(ipts, buffer, size, report_id, report_type,
+-					     request_type);
++		ret = ipts_eds2_raw_request(ipts, buffer, size, report_id, report_type,
++					    request_type);
+ 	}
++
++	ipts_hid_exit(ipts);
++	return ret;
+ }
+ 
+ static struct hid_ll_driver ipts_hid_driver = {
+@@ -185,6 +241,7 @@ int ipts_hid_init(struct ipts_context *ipts, struct ipts_device_info info)
+ 	if (IS_ERR(ipts->hid)) {
+ 		int err = PTR_ERR(ipts->hid);
+ 
++		ipts->hid = NULL;
+ 		dev_err(ipts->dev, "Failed to allocate HID device: %d\n", err);
+ 		return err;
+ 	}
+@@ -200,10 +257,13 @@ int ipts_hid_init(struct ipts_context *ipts, struct ipts_device_info info)
+ 	snprintf(ipts->hid->name, sizeof(ipts->hid->name), "IPTS %04X:%04X", info.vendor,
+ 		 info.product);
+ 
++	/*
++	 * On failure ipts->hid stays set: the receiver may already be using it,
++	 * so it is destroyed by ipts_control_stop() after the receiver stopped.
++	 */
+ 	ret = hid_add_device(ipts->hid);
+ 	if (ret) {
+ 		dev_err(ipts->dev, "Failed to add HID device: %d\n", ret);
+-		ipts_hid_free(ipts);
+ 		return ret;
+ 	}
+ 
+@@ -215,8 +275,10 @@ int ipts_hid_free(struct ipts_context *ipts)
+ 	if (!ipts)
+ 		return -EFAULT;
+ 
+-	if (!ipts->hid)
++	if (IS_ERR_OR_NULL(ipts->hid)) {
++		ipts->hid = NULL;
+ 		return 0;
++	}
+ 
+ 	hid_destroy_device(ipts->hid);
+ 	ipts->hid = NULL;
+diff --git a/drivers/hid/ipts/hid.h b/drivers/hid/ipts/hid.h
+index 1ebe774..e3de479 100644
+--- a/drivers/hid/ipts/hid.h
++++ b/drivers/hid/ipts/hid.h
+@@ -16,6 +16,15 @@
+ void ipts_hid_enable(struct ipts_context *ipts);
+ void ipts_hid_disable(struct ipts_context *ipts);
+ 
++/**
++ * ipts_hid_quiesce() - Disable HID callbacks and wait for running ones to return.
++ * @ipts: The IPTS driver context.
++ * @timeout_ms: How long to wait at most.
++ *
++ * Returns: 0 when no callback is running, -ETIMEDOUT if one never returned.
++ */
++int ipts_hid_quiesce(struct ipts_context *ipts, unsigned int timeout_ms);
++
+ int ipts_hid_input_data(struct ipts_context *ipts, u32 buffer);
+ 
+ int ipts_hid_init(struct ipts_context *ipts, struct ipts_device_info info);
+diff --git a/drivers/hid/ipts/main.c b/drivers/hid/ipts/main.c
+index fb5b5c1..760d6be 100644
+--- a/drivers/hid/ipts/main.c
++++ b/drivers/hid/ipts/main.c
+@@ -39,6 +39,33 @@ static int ipts_set_dma_mask(struct mei_cl_device *cldev)
+ 	return dma_coerce_mask_and_coherent(&cldev->dev, DMA_BIT_MASK(32));
+ }
+ 
++/*
++ * The receiver thread or a HID request is stuck in driver code. Keep
++ * everything it may still touch alive for good: the context, its buffers,
++ * the MEI device and the module text. Touch stays off until the next boot.
++ */
++static void ipts_leak_wedged(struct mei_cl_device *cldev, struct ipts_context *ipts)
++{
++	dev_err(&cldev->dev,
++		"IPTS is wedged (%s): leaking its context and keeping the module loaded until reboot\n",
++		ipts->wedged ? "receiver thread stuck or dead" : "HID request stuck");
++
++	get_device(&cldev->dev);
++	mei_cldev_disable(cldev);
++
++	/*
++	 * Pin the module: the leaked HID device and a stuck thread still point
++	 * into its code. If the module is already being unloaded (rmmod), the
++	 * pin is impossible, and returning would free that code under them, so
++	 * this remove never returns. A reboot ends it.
++	 */
++	if (!try_module_get(THIS_MODULE)) {
++		dev_emerg(&cldev->dev, "IPTS is wedged during module unload: blocking the unload\n");
++		for (;;)
++			msleep(60 * MSEC_PER_SEC);
++	}
++}
++
+ static int ipts_probe(struct mei_cl_device *cldev, const struct mei_cl_device_id *id)
+ {
+ 	int ret = 0;
+@@ -59,33 +86,53 @@ static int ipts_probe(struct mei_cl_device *cldev, const struct mei_cl_device_id
+ 		return ret;
+ 	}
+ 
+-	ipts = devm_kzalloc(&cldev->dev, sizeof(*ipts), GFP_KERNEL);
++	/*
++	 * Not devm: if the context ever gets wedged, it must outlive the device.
++	 */
++	ipts = kzalloc(sizeof(*ipts), GFP_KERNEL);
+ 	if (!ipts) {
+ 		mei_cldev_disable(cldev);
+ 		return -ENOMEM;
+ 	}
+ 
+-	ret = ipts_mei_init(&ipts->mei, cldev);
+-	if (ret) {
+-		dev_err(&cldev->dev, "Failed to init MEI bus logic: %d\n", ret);
+-		return ret;
+-	}
+-
+ 	ipts->dev = &cldev->dev;
+ 	ipts->mode = IPTS_MODE_EVENT;
+ 
+ 	mutex_init(&ipts->feature_lock);
+ 	init_completion(&ipts->feature_event);
++	ipts_control_init(ipts);
+ 
+ 	mei_cldev_set_drvdata(cldev, ipts);
+ 
++	ret = ipts_mei_init(&ipts->mei, cldev);
++	if (ret) {
++		dev_err(&cldev->dev, "Failed to init MEI bus logic: %d\n", ret);
++		goto err_free;
++	}
++
++	mutex_lock(&ipts->ctl_lock);
+ 	ret = ipts_control_start(ipts);
++	mutex_unlock(&ipts->ctl_lock);
++
++	if (ret == -ETIMEDOUT) {
++		ipts_leak_wedged(cldev, ipts);
++		return ret;
++	}
++
+ 	if (ret) {
+ 		dev_err(&cldev->dev, "Failed to start IPTS: %d\n", ret);
+-		return ret;
++		goto err_free;
+ 	}
+ 
+ 	return 0;
++
++err_free:
++	disable_work_sync(&ipts->restart_work);
++	mei_cldev_disable(cldev);
++	ipts_mei_free_messages(&ipts->mei);
++	mei_cldev_set_drvdata(cldev, NULL);
++	kfree(ipts);
++	return ret;
+ }
+ 
+ static void ipts_remove(struct mei_cl_device *cldev)
+@@ -99,12 +146,37 @@ static void ipts_remove(struct mei_cl_device *cldev)
+ 	}
+ 
+ 	ipts = mei_cldev_get_drvdata(cldev);
++	if (!ipts) {
++		mei_cldev_disable(cldev);
++		return;
++	}
++
++	/*
++	 * No new restarts, and wait for one that is already running.
++	 */
++	WRITE_ONCE(ipts->removing, true);
++	disable_work_sync(&ipts->restart_work);
+ 
++	mutex_lock(&ipts->ctl_lock);
+ 	ret = ipts_control_stop(ipts);
++	mutex_unlock(&ipts->ctl_lock);
++
++	if (ret == -ETIMEDOUT) {
++		ipts_leak_wedged(cldev, ipts);
++		return;
++	}
++
+ 	if (ret)
+ 		dev_err(&cldev->dev, "Failed to stop IPTS: %d\n", ret);
+ 
++	/*
++	 * Disabling the client cancels the receive callback, so nothing can add
++	 * to the message list after this.
++	 */
+ 	mei_cldev_disable(cldev);
++	ipts_mei_free_messages(&ipts->mei);
++	mei_cldev_set_drvdata(cldev, NULL);
++	kfree(ipts);
+ }
+ 
+ static struct mei_cl_device_id ipts_device_id_table[] = {
+diff --git a/drivers/hid/ipts/mei.c b/drivers/hid/ipts/mei.c
+index 60c2ec5..5417b9d 100644
+--- a/drivers/hid/ipts/mei.c
++++ b/drivers/hid/ipts/mei.c
+@@ -5,6 +5,7 @@
+  * Linux driver for Intel Precise Touch & Stylus
+  */
+ 
++#include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/errno.h>
+ #include <linux/jiffies.h>
+@@ -12,18 +13,64 @@
+ #include <linux/mei_cl_bus.h>
+ #include <linux/printk.h>
+ #include <linux/rwsem.h>
++#include <linux/sched/signal.h>
++#include <linux/slab.h>
+ #include <linux/types.h>
+ #include <linux/wait.h>
+ 
+ #include "context.h"
+ #include "mei.h"
+ 
+-static void locked_list_add(struct list_head *new, struct list_head *head,
+-			    struct rw_semaphore *lock)
++/*
++ * Take the message lock, but never wait for it forever. It is only ever held
++ * across a list operation, so a holder that keeps it through several timeouts
++ * died (oops) or is stuck. From then on, fail fast.
++ */
++static bool ipts_mei_lock(struct ipts_mei *mei)
+ {
+-	down_write(lock);
+-	list_add(new, head);
+-	up_write(lock);
++	void *owner = NULL;
++	unsigned long end = 0;
++
++	if (down_write_trylock(&mei->message_lock))
++		goto locked;
++
++	if (READ_ONCE(mei->lock_lost))
++		return false;
++
++	end = jiffies + msecs_to_jiffies(IPTS_MEI_LOCK_TIMEOUT_MS);
++
++	while (!down_write_trylock(&mei->message_lock)) {
++		if (!time_after(jiffies, end)) {
++			usleep_range(200, 500);
++			continue;
++		}
++
++		owner = READ_ONCE(mei->owner);
++		if (owner == READ_ONCE(mei->stuck_owner)) {
++			WRITE_ONCE(mei->stuck_count, mei->stuck_count + 1);
++		} else {
++			WRITE_ONCE(mei->stuck_owner, owner);
++			WRITE_ONCE(mei->stuck_count, 1);
++		}
++
++		if (READ_ONCE(mei->stuck_count) >= IPTS_MEI_LOCK_LOST_COUNT &&
++		    !xchg(&mei->lock_lost, true))
++			dev_err(&mei->cldev->dev,
++				"Message lock held by a stuck or dead task, touch input is disabled until the driver is reloaded\n");
++
++		return false;
++	}
++
++locked:
++	WRITE_ONCE(mei->owner, current);
++	return true;
++}
++
++static void ipts_mei_unlock(struct ipts_mei *mei)
++{
++	WRITE_ONCE(mei->owner, NULL);
++	WRITE_ONCE(mei->stuck_count, 0);
++	up_write(&mei->message_lock);
+ }
+ 
+ static void ipts_mei_incoming(struct mei_cl_device *cldev)
+@@ -43,7 +90,7 @@ static void ipts_mei_incoming(struct mei_cl_device *cldev)
+ 		return;
+ 	}
+ 
+-	entry = devm_kzalloc(ipts->dev, sizeof(*entry), GFP_KERNEL);
++	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+ 	if (!entry)
+ 		return;
+ 
+@@ -55,15 +102,25 @@ static void ipts_mei_incoming(struct mei_cl_device *cldev)
+ 
+ 	if (ret < 0) {
+ 		dev_err(ipts->dev, "Error while reading response: %ld\n", ret);
++		kfree(entry);
+ 		return;
+ 	}
+ 
+ 	if (ret == 0) {
+ 		dev_err(ipts->dev, "Received empty response\n");
++		kfree(entry);
++		return;
++	}
++
++	if (!ipts_mei_lock(&ipts->mei)) {
++		kfree(entry);
+ 		return;
+ 	}
+ 
+-	locked_list_add(&entry->list, &ipts->mei.messages, &ipts->mei.message_lock);
++	list_add(&entry->list, &ipts->mei.messages);
++	WRITE_ONCE(ipts->mei.seq, ipts->mei.seq + 1);
++	ipts_mei_unlock(&ipts->mei);
++
+ 	wake_up_all(&ipts->mei.message_queue);
+ }
+ 
+@@ -71,6 +128,7 @@ static int ipts_mei_search(struct ipts_mei *mei, enum ipts_command_code code,
+ 			   struct ipts_response *rsp)
+ {
+ 	struct ipts_mei_message *entry = NULL;
++	struct ipts_mei_message *found = NULL;
+ 
+ 	if (!mei)
+ 		return -EFAULT;
+@@ -78,71 +136,84 @@ static int ipts_mei_search(struct ipts_mei *mei, enum ipts_command_code code,
+ 	if (!rsp)
+ 		return -EFAULT;
+ 
+-	down_write(&mei->message_lock);
+-
+ 	/*
+ 	 * Iterate over the list of received messages, and check if there is one
+-	 * matching the requested command code.
++	 * matching the requested command code. The message is taken off the list
++	 * under the same write lock that found it: two waiters for the same command
++	 * code (the poll thread and a HID request from userspace) must never both
++	 * get the same entry, or the second list_del() faults on the poisoned
++	 * pointers while it holds the lock.
+ 	 */
++	if (!ipts_mei_lock(mei))
++		return READ_ONCE(mei->lock_lost) ? -EDEADLK : -EAGAIN;
++
+ 	list_for_each_entry(entry, &mei->messages, list) {
+-		if (entry->rsp.cmd == code)
++		if (entry->rsp.cmd == code) {
++			found = entry;
++			list_del(&entry->list);
+ 			break;
++		}
+ 	}
+ 
+-	/*
+-	 * If entry is not the list head, this means that the loop above has been stopped early,
+-	 * and that we found a matching element. We drop the message from the list while still
+-	 * holding the lock, so that no other waiter can claim the same entry, and return it.
+-	 */
+-	if (!list_entry_is_head(entry, &mei->messages, list)) {
+-		list_del(&entry->list);
+-		up_write(&mei->message_lock);
++	ipts_mei_unlock(mei);
+ 
+-		*rsp = entry->rsp;
+-		devm_kfree(&mei->cldev->dev, entry);
++	if (!found)
++		return -EAGAIN;
+ 
+-		return 0;
+-	}
+-
+-	up_write(&mei->message_lock);
++	*rsp = found->rsp;
++	kfree(found);
+ 
+-	return -EAGAIN;
++	return 0;
+ }
+ 
+ int ipts_mei_recv(struct ipts_mei *mei, enum ipts_command_code code, struct ipts_response *rsp,
+ 		  u64 timeout)
+ {
+ 	int ret = 0;
++	long left = 0;
++	unsigned long seq = 0;
++	unsigned long end = 0;
+ 
+ 	if (!mei)
+ 		return -EFAULT;
+ 
+ 	/*
+-	 * A timeout of 0 means check and return immideately.
++	 * A timeout of 0 means check and return immediately.
+ 	 */
+ 	if (timeout == 0)
+ 		return ipts_mei_search(mei, code, rsp);
+ 
++	end = jiffies + msecs_to_jiffies(timeout);
++
+ 	/*
+-	 * A timeout of less than 0 means to wait forever.
++	 * Search with the task running, then sleep until a new message is queued
++	 * or the time is up. Reading seq before the search means a message that
++	 * arrives in between ends the sleep at once.
+ 	 */
+-	if (timeout < 0) {
+-		wait_event(mei->message_queue, ipts_mei_search(mei, code, rsp) == 0);
+-		return 0;
+-	}
++	for (;;) {
++		seq = READ_ONCE(mei->seq);
++
++		/*
++		 * Read seq before the list. ipts_mei_incoming() adds the message
++		 * before it increments seq, both under message_lock.
++		 */
++		smp_rmb();
+ 
+-	ret = wait_event_timeout(mei->message_queue, ipts_mei_search(mei, code, rsp) == 0,
+-				 msecs_to_jiffies(timeout));
++		ret = ipts_mei_search(mei, code, rsp);
++		if (ret != -EAGAIN)
++			return ret;
+ 
+-	if (ret > 0)
+-		return 0;
++		left = (long)(end - jiffies);
++		if (left <= 0)
++			return -EAGAIN;
+ 
+-	return -EAGAIN;
++		wait_event_timeout(mei->message_queue, READ_ONCE(mei->seq) != seq, left);
++	}
+ }
+ 
+ int ipts_mei_send(struct ipts_mei *mei, void *data, size_t length)
+ {
+-	int ret = 0;
++	ssize_t ret = 0;
+ 
+ 	if (!mei)
+ 		return -EFAULT;
+@@ -153,9 +224,12 @@ int ipts_mei_send(struct ipts_mei *mei, void *data, size_t length)
+ 	if (!data)
+ 		return -EFAULT;
+ 
+-	do {
+-		ret = mei_cldev_send(mei->cldev, (u8 *)data, length);
+-	} while (ret == -EINTR);
++	/*
++	 * Bounded: a send that is not acknowledged in time fails. An interrupted
++	 * send is not retried, because the message is already queued and would
++	 * go out twice.
++	 */
++	ret = mei_cldev_send_timeout(mei->cldev, (u8 *)data, length, IPTS_MEI_SEND_TIMEOUT_MS);
+ 
+ 	if (ret < 0)
+ 		return ret;
+@@ -163,6 +237,25 @@ int ipts_mei_send(struct ipts_mei *mei, void *data, size_t length)
+ 	return 0;
+ }
+ 
++void ipts_mei_free_messages(struct ipts_mei *mei)
++{
++	struct ipts_mei_message *entry = NULL;
++	struct ipts_mei_message *tmp = NULL;
++
++	if (!mei)
++		return;
++
++	if (!ipts_mei_lock(mei))
++		return;
++
++	list_for_each_entry_safe(entry, tmp, &mei->messages, list) {
++		list_del(&entry->list);
++		kfree(entry);
++	}
++
++	ipts_mei_unlock(mei);
++}
++
+ int ipts_mei_init(struct ipts_mei *mei, struct mei_cl_device *cldev)
+ {
+ 	if (!mei)
+@@ -172,12 +265,15 @@ int ipts_mei_init(struct ipts_mei *mei, struct mei_cl_device *cldev)
+ 		return -EFAULT;
+ 
+ 	mei->cldev = cldev;
++	mei->seq = 0;
++	mei->lock_lost = false;
++	mei->owner = NULL;
++	mei->stuck_owner = NULL;
++	mei->stuck_count = 0;
+ 
+ 	INIT_LIST_HEAD(&mei->messages);
+ 	init_waitqueue_head(&mei->message_queue);
+ 	init_rwsem(&mei->message_lock);
+ 
+-	mei_cldev_register_rx_cb(cldev, ipts_mei_incoming);
+-
+-	return 0;
++	return mei_cldev_register_rx_cb(cldev, ipts_mei_incoming);
+ }
+diff --git a/drivers/hid/ipts/mei.h b/drivers/hid/ipts/mei.h
+index 973bade..4d5b968 100644
+--- a/drivers/hid/ipts/mei.h
++++ b/drivers/hid/ipts/mei.h
+@@ -28,18 +28,49 @@ struct ipts_mei {
+ 
+ 	wait_queue_head_t message_queue;
+ 	struct rw_semaphore message_lock;
++
++	/*
++	 * Bumped under message_lock whenever a message is queued, so waiters
++	 * can sleep without taking the lock inside the wait condition.
++	 */
++	unsigned long seq;
++
++	/*
++	 * Set once the same task held message_lock through IPTS_MEI_LOCK_LOST_COUNT
++	 * acquire timeouts. Nobody holds it for longer than a list operation, so
++	 * its holder is dead or stuck and the lock is gone for good.
++	 */
++	bool lock_lost;
++
++	/*
++	 * Who holds message_lock (compared, never dereferenced), and how many
++	 * acquire timeouts in a row saw the same holder.
++	 */
++	void *owner;
++	void *stuck_owner;
++	unsigned int stuck_count;
+ };
+ 
++/*
++ * The lock is declared lost after this many timeouts with the same holder.
++ */
++#define IPTS_MEI_LOCK_LOST_COUNT 3
++
++/*
++ * Upper bounds for one lock acquire and one send.
++ */
++#define IPTS_MEI_LOCK_TIMEOUT_MS 1000
++#define IPTS_MEI_SEND_TIMEOUT_MS 2000
++
+ /**
+  * ipts_mei_recv() - Receive data from a MEI device.
+  * @mei: The IPTS MEI device context.
+  * @code: The IPTS command code to look for.
+  * @rsp: The address that the received data will be copied to.
+- * @timeout: How many milliseconds the function will wait at most.
++ * @timeout: How many milliseconds the function will wait at most (0 = do not wait).
+  *
+- * A negative timeout means to wait forever.
+- *
+- * Returns: 0 on success, <0 on error, -EAGAIN if no response has been received.
++ * Returns: 0 on success, <0 on error, -EAGAIN if no response has been received,
++ * -EDEADLK if the message lock is lost.
+  */
+ int ipts_mei_recv(struct ipts_mei *mei, enum ipts_command_code code, struct ipts_response *rsp,
+ 		  u64 timeout);
+@@ -63,4 +94,12 @@ int ipts_mei_send(struct ipts_mei *mei, void *data, size_t length);
+  */
+ int ipts_mei_init(struct ipts_mei *mei, struct mei_cl_device *cldev);
+ 
++/**
++ * ipts_mei_free_messages() - Free every queued message.
++ * @mei: The MEI device context.
++ *
++ * Leaks them instead if the message lock is lost.
++ */
++void ipts_mei_free_messages(struct ipts_mei *mei);
++
+ #endif /* IPTS_MEI_H */
+diff --git a/drivers/hid/ipts/receiver.c b/drivers/hid/ipts/receiver.c
+index 977724c..dd02e70 100644
+--- a/drivers/hid/ipts/receiver.c
++++ b/drivers/hid/ipts/receiver.c
+@@ -47,6 +47,42 @@ static void ipts_receiver_backoff(time64_t last, u32 n)
+ 		msleep(200);
+ }
+ 
++/*
++ * How long the end of a stop waits for the device to confirm QUIESCE_IO.
++ */
++#define IPTS_STOP_CONFIRM_MS 3000
++
++/*
++ * End of a receiver loop, after QUIESCE_IO was sent: collect the last
++ * READY_FOR_DATA reply, then wait for the QUIESCE_IO confirmation even if that
++ * reply was lost. Starting the device again before it has stopped can leave
++ * its firmware unresponsive until the next boot.
++ *
++ * Returns 0 only when the device confirmed the stop. Anything else makes
++ * _ipts_control_stop() keep the buffers, which the device may still write to.
++ */
++static int ipts_receiver_finish(struct ipts_context *ipts)
++{
++	int ret = 0;
++	unsigned long end = 0;
++
++	ret = ipts_control_wait_data(ipts, true);
++	if (ret && ret != -EAGAIN)
++		dev_err(ipts->dev, "Failed to wait for data: %d\n", ret);
++
++	end = jiffies + msecs_to_jiffies(IPTS_STOP_CONFIRM_MS);
++	do {
++		ret = ipts_control_wait_flush(ipts);
++	} while (ret == -EAGAIN && time_before(jiffies, end));
++
++	if (ret) {
++		dev_warn(ipts->dev, "Device did not confirm the stop: %d\n", ret);
++		return ret == -EAGAIN ? -ETIMEDOUT : ret;
++	}
++
++	return 0;
++}
++
+ static int ipts_receiver_event_loop(struct ipts_thread *thread)
+ {
+ 	int ret = 0;
+@@ -68,13 +104,14 @@ static int ipts_receiver_event_loop(struct ipts_thread *thread)
+ 	while (!ipts_thread_should_stop(thread)) {
+ 		int i = 0;
+ 
+-		for (i = 0; i < IPTS_BUFFERS; i++) {
++		for (i = 0; i < IPTS_BUFFERS && !ipts_thread_should_stop(thread); i++) {
+ 			ret = ipts_control_wait_data(ipts, false);
+ 			if (ret == -EAGAIN)
+ 				break;
+ 
+ 			if (ret) {
+-				dev_err(ipts->dev, "Failed to wait for data: %d\n", ret);
++				dev_err_ratelimited(ipts->dev,
++						    "Failed to wait for data: %d\n", ret);
+ 				continue;
+ 			}
+ 
+@@ -83,15 +120,17 @@ static int ipts_receiver_event_loop(struct ipts_thread *thread)
+ 
+ 			ret = ipts_hid_input_data(ipts, buffer);
+ 			if (ret)
+-				dev_err(ipts->dev, "Failed to process buffer: %d\n", ret);
++				dev_err_ratelimited(ipts->dev,
++						    "Failed to process buffer: %d\n", ret);
+ 
+ 			ret = ipts_control_refill_buffer(ipts, buffer);
+ 			if (ret)
+-				dev_err(ipts->dev, "Failed to send feedback: %d\n", ret);
++				dev_err_ratelimited(ipts->dev,
++						    "Failed to send feedback: %d\n", ret);
+ 
+ 			ret = ipts_control_request_data(ipts);
+ 			if (ret)
+-				dev_err(ipts->dev, "Failed to request data: %d\n", ret);
++				dev_err_ratelimited(ipts->dev, "Failed to request data: %d\n", ret);
+ 
+ 			last = ktime_get_seconds();
+ 		}
+@@ -105,27 +144,7 @@ static int ipts_receiver_event_loop(struct ipts_thread *thread)
+ 		return ret;
+ 	}
+ 
+-	ret = ipts_control_wait_data(ipts, true);
+-	if (ret) {
+-		dev_err(ipts->dev, "Failed to wait for data: %d\n", ret);
+-
+-		if (ret != -EAGAIN)
+-			return ret;
+-		else
+-			return 0;
+-	}
+-
+-	ret = ipts_control_wait_flush(ipts);
+-	if (ret) {
+-		dev_err(ipts->dev, "Failed to wait for flush: %d\n", ret);
+-
+-		if (ret != -EAGAIN)
+-			return ret;
+-		else
+-			return 0;
+-	}
+-
+-	return 0;
++	return ipts_receiver_finish(ipts);
+ }
+ 
+ static int ipts_receiver_poll_loop(struct ipts_thread *thread)
+@@ -160,21 +179,32 @@ static int ipts_receiver_poll_loop(struct ipts_thread *thread)
+ 
+ 		doorbell = ipts_receiver_current_doorbell(ipts);
+ 
++		/*
++		 * Only the last IPTS_BUFFERS buffers can still hold data, so never
++		 * walk further back than that, whatever value the doorbell has.
++		 */
++		if ((s32)(doorbell - lastdb) < 0)
++			lastdb = doorbell;
++		else if (doorbell - lastdb > IPTS_BUFFERS)
++			lastdb = doorbell - IPTS_BUFFERS;
++
+ 		/*
+ 		 * After filling up one of the data buffers, IPTS will increment
+ 		 * the doorbell. The value of the doorbell stands for the *next*
+ 		 * buffer that IPTS is going to fill.
+ 		 */
+-		while (lastdb != doorbell) {
++		while (lastdb != doorbell && !ipts_thread_should_stop(thread)) {
+ 			buffer = lastdb % IPTS_BUFFERS;
+ 
+ 			ret = ipts_hid_input_data(ipts, buffer);
+ 			if (ret)
+-				dev_err(ipts->dev, "Failed to process buffer: %d\n", ret);
++				dev_err_ratelimited(ipts->dev,
++						    "Failed to process buffer: %d\n", ret);
+ 
+ 			ret = ipts_control_refill_buffer(ipts, buffer);
+ 			if (ret)
+-				dev_err(ipts->dev, "Failed to send feedback: %d\n", ret);
++				dev_err_ratelimited(ipts->dev,
++						    "Failed to send feedback: %d\n", ret);
+ 
+ 			last = ktime_get_seconds();
+ 			lastdb++;
+@@ -186,27 +216,7 @@ static int ipts_receiver_poll_loop(struct ipts_thread *thread)
+ 		ipts_receiver_backoff(last, 5);
+ 	}
+ 
+-	ret = ipts_control_wait_data(ipts, true);
+-	if (ret) {
+-		dev_err(ipts->dev, "Failed to wait for data: %d\n", ret);
+-
+-		if (ret != -EAGAIN)
+-			return ret;
+-		else
+-			return 0;
+-	}
+-
+-	ret = ipts_control_wait_flush(ipts);
+-	if (ret) {
+-		dev_err(ipts->dev, "Failed to wait for flush: %d\n", ret);
+-
+-		if (ret != -EAGAIN)
+-			return ret;
+-		else
+-			return 0;
+-	}
+-
+-	return 0;
++	return ipts_receiver_finish(ipts);
+ }
+ 
+ int ipts_receiver_start(struct ipts_context *ipts)
+@@ -242,6 +252,7 @@ int ipts_receiver_stop(struct ipts_context *ipts)
+ 		return -EFAULT;
+ 
+ 	ret = ipts_thread_stop(&ipts->receiver_loop);
++
+ 	if (ret) {
+ 		dev_err(ipts->dev, "Failed to stop receiver loop: %d\n", ret);
+ 		return ret;
+diff --git a/drivers/hid/ipts/thread.c b/drivers/hid/ipts/thread.c
+index 355e92b..34af886 100644
+--- a/drivers/hid/ipts/thread.c
++++ b/drivers/hid/ipts/thread.c
+@@ -9,6 +9,9 @@
+ #include <linux/err.h>
+ #include <linux/kthread.h>
+ #include <linux/mutex.h>
++#include <linux/printk.h>
++#include <linux/sched.h>
++#include <linux/sched/task.h>
+ 
+ #include "thread.h"
+ 
+@@ -28,10 +31,14 @@ static int ipts_thread_runner(void *data)
+ 	if (!thread)
+ 		return -EFAULT;
+ 
+-	if (!thread->threadfn)
+-		return -EFAULT;
++	if (thread->threadfn)
++		ret = thread->threadfn(thread);
++	else
++		ret = -EFAULT;
+ 
+-	ret = thread->threadfn(thread);
++	/*
++	 * Complete on every exit path, ipts_thread_stop() waits for this.
++	 */
+ 	complete_all(&thread->done);
+ 
+ 	return ret;
+@@ -46,14 +53,33 @@ int ipts_thread_start(struct ipts_thread *thread, int (*threadfn)(struct ipts_th
+ 	if (!threadfn)
+ 		return -EFAULT;
+ 
++	struct task_struct *task = NULL;
++
+ 	init_completion(&thread->done);
+ 
+ 	thread->data = data;
++	thread->wedged = false;
++	thread->exit_code = 0;
+ 	thread->should_stop = false;
+ 	thread->threadfn = threadfn;
+ 
+-	thread->thread = kthread_run(ipts_thread_runner, thread, name);
+-	return PTR_ERR_OR_ZERO(thread->thread);
++	task = kthread_create(ipts_thread_runner, thread, "%s", name);
++	if (IS_ERR(task)) {
++		thread->thread = NULL;
++		thread->threadfn = NULL;
++		thread->data = NULL;
++		return PTR_ERR(task);
++	}
++
++	/*
++	 * Keep the task_struct around until ipts_thread_stop() is done with it,
++	 * even if the thread exits on its own (or dies) before that.
++	 */
++	get_task_struct(task);
++	thread->thread = task;
++	wake_up_process(task);
++
++	return 0;
+ }
+ 
+ int ipts_thread_stop(struct ipts_thread *thread)
+@@ -66,6 +92,9 @@ int ipts_thread_stop(struct ipts_thread *thread)
+ 	if (!thread->thread)
+ 		return 0;
+ 
++	if (thread->wedged)
++		return -ETIMEDOUT;
++
+ 	WRITE_ONCE(thread->should_stop, true);
+ 
+ 	/*
+@@ -73,9 +102,36 @@ int ipts_thread_stop(struct ipts_thread *thread)
+ 	 */
+ 	wmb();
+ 
+-	wait_for_completion(&thread->done);
+-	ret = kthread_stop(thread->thread);
++	if (!wait_for_completion_timeout(&thread->done,
++					 msecs_to_jiffies(IPTS_THREAD_STOP_TIMEOUT_MS))) {
++		/*
++		 * A thread that died in an oops is unwinding through do_exit()
++		 * and will never run driver code again. kthread_stop() could
++		 * wait forever on it (its exit may never complete), so just drop
++		 * the reference.
++		 */
++		if (thread->thread->flags & PF_EXITING) {
++			pr_err("ipts: thread %s died without finishing, continuing stop\n",
++			       thread->thread->comm);
++			put_task_struct(thread->thread);
++			ret = -EOWNERDEAD;
++			goto out;
++		}
++
++		thread->wedged = true;
++		return -ETIMEDOUT;
++	}
++
++	/*
++	 * The exit code reflects the shutdown handshake with the firmware. The
++	 * thread is gone either way, so it does not fail the stop; the caller
++	 * decides from it whether the device let go of its buffers.
++	 */
++	thread->exit_code = kthread_stop(thread->thread);
++	put_task_struct(thread->thread);
++	ret = 0;
+ 
++out:
+ 	thread->thread = NULL;
+ 	thread->data = NULL;
+ 	thread->threadfn = NULL;
+diff --git a/drivers/hid/ipts/thread.h b/drivers/hid/ipts/thread.h
+index 1f966b8..4b51be5 100644
+--- a/drivers/hid/ipts/thread.h
++++ b/drivers/hid/ipts/thread.h
+@@ -21,6 +21,17 @@
+ struct ipts_thread {
+ 	struct task_struct *thread;
+ 
++	/*
++	 * Set when the thread did not finish within the stop timeout and is
++	 * still alive. Nothing the thread can touch may be freed after that.
++	 */
++	bool wedged;
++
++	/*
++	 * Return value of the thread function, valid after a successful stop.
++	 */
++	int exit_code;
++
+ 	bool should_stop;
+ 	struct completion done;
+ 
+@@ -48,11 +59,24 @@ bool ipts_thread_should_stop(struct ipts_thread *thread);
+ int ipts_thread_start(struct ipts_thread *thread, int (*threadfn)(struct ipts_thread *thread),
+ 		      void *data, const char name[]);
+ 
++/*
++ * How long ipts_thread_stop() waits for the thread function to return. The
++ * worst normal shutdown handshake is a few MEI round trips (each bounded at
++ * about 2 s), so this only expires if the thread is stuck for good.
++ */
++#define IPTS_THREAD_STOP_TIMEOUT_MS 20000
++
+ /**
+  * ipts_thread_stop() - Asks the thread to terminate and waits until it has finished.
+  * @thread: The thread that should stop.
+  *
+- * Returns: The return value of the thread function.
++ * The wait is bounded. If the thread died (oops) without finishing, it can no
++ * longer run driver code, so it is treated as stopped. If it is still alive
++ * after the timeout, it is marked wedged and left running.
++ *
++ * Returns: 0 if the thread finished (its exit code is in thread->exit_code),
++ * -EOWNERDEAD if it died without finishing (it is gone, but it never ran the
++ * shutdown handshake), -ETIMEDOUT if it is wedged, <0 on invalid arguments.
+  */
+ int ipts_thread_stop(struct ipts_thread *thread);
+ 
+-- 
+2.43.0
+
