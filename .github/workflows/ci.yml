@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test tools
+        run: python -m pip install pytest ruff
+
+      - name: ruff
+        run: ruff check .
+
+      - name: shellcheck
+        run: git ls-files -z '*.sh' | xargs -0 shellcheck -S warning
+
+      - name: pytest (checkers, fixtures, real series and evidence)
+        run: python -m pytest -v
+
+      - name: Lint the patch series
+        run: |
+          python tools/seriescheck.py series/ipts-rfc series/ipts-rfc/on-pr178 series/ipu4p series/libcamera
+          python tools/seriescheck.py --plain patches/kernel patches/libcamera patches/pipewire
+          python tools/seriescheck.py --plain --add-only --rules d5 fault-injection/ipts-fault-inject.patch
+
+      - name: Check the recorded evidence
+        run: python tools/evidencecheck.py evidence/ipts-f3
+
+      - name: Compile the camera helpers
+        run: python -m py_compile camcheck/*.py
+
+      - name: Build the deadman module against the runner's kernel headers
+        run: |
+          sudo apt-get update -qq
+          if sudo apt-get install -y -qq "linux-headers-$(uname -r)"; then
+            KDIR="/lib/modules/$(uname -r)/build"
+          else
+            sudo apt-get install -y -qq linux-headers-generic
+            KDIR=$(ls -d /usr/src/linux-headers-*-generic | sort -V | tail -1)
+          fi
+          echo "building against $KDIR"
+          make -C fault-injection/deadman KDIR="$KDIR" 2>&1 | tee build.log
+          test -f fault-injection/deadman/sp7_deadman.ko
+          ! grep -E 'sp7_deadman\.c:[0-9]+:[0-9]+: (warning|error)' build.log
