@@ -16,7 +16,7 @@ index 1f4b2d394..9fb1e0129 100644
  
 +	bool acquireDevice(Camera *camera) override;
 +	void releaseDevice(Camera *camera) override;
-+	unsigned int videoUsers(V4L2VideoDevice *video);
++	Mutex &videoUsersLock() { return videoUsersLock_; }
 +
  	V4L2VideoDevice *video(const MediaEntity *entity);
  	V4L2Subdevice *subdev(const MediaEntity *entity);
@@ -35,14 +35,17 @@ index 1f4b2d394..9fb1e0129 100644
  	std::shared_ptr<MediaDevice> converter_;
  	bool swIspEnabled_;
  };
-@@ -1372,7 +1384,21 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
+@@ -1372,7 +1384,24 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
  			format.fourcc = data_->video_->toV4L2PixelFormat(cfg.pixelFormat);
  			format.size = cfg.size;
  
 +			/*
 +			 * The video node is closed while the camera is not
 +			 * acquired, see SimplePipelineHandler::acquireDevice().
++			 * Hold videoUsersLock_ so that no camera sharing the
++			 * node acquires it between the open and the close.
 +			 */
++			MutexLocker locker(data_->pipe()->videoUsersLock());
 +			bool opened = false;
 +			if (!data_->video_->isOpen()) {
 +				if (data_->video_->open() < 0)
@@ -51,13 +54,13 @@ index 1f4b2d394..9fb1e0129 100644
 +			}
 +
  			int ret = data_->video_->tryFormat(&format);
-+			/* Another camera may have acquired the node meanwhile */
-+			if (opened && !data_->pipe()->videoUsers(data_->video_))
++			if (opened)
 +				data_->video_->close();
++			locker.unlock();
  			if (ret < 0)
  				return Invalid;
  
-@@ -2028,9 +2054,60 @@ bool SimplePipelineHandler::matchDevice(std::shared_ptr<MediaDevice> media,
+@@ -2028,9 +2057,53 @@ bool SimplePipelineHandler::matchDevice(std::shared_ptr<MediaDevice> media,
  		registered = true;
  	}
  
@@ -75,13 +78,6 @@ index 1f4b2d394..9fb1e0129 100644
  	return registered;
  }
  
-+unsigned int SimplePipelineHandler::videoUsers(V4L2VideoDevice *video)
-+{
-+	MutexLocker locker(videoUsersLock_);
-+	auto it = videoUsers_.find(video);
-+	return it == videoUsers_.end() ? 0 : it->second;
-+}
-+
 +bool SimplePipelineHandler::acquireDevice(Camera *camera)
 +{
 +	SimpleCameraData *data = cameraData(camera);

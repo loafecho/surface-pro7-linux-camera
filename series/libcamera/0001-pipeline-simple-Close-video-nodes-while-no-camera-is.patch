@@ -23,7 +23,8 @@ acquireDevice(), as the uvcvideo pipeline handler already does. Several
 cameras can share one video node, so count the acquired cameras per
 node and close it only when the last one is released. validate() may
 run on a camera that is not acquired, so open the node temporarily
-around tryFormat() when needed.
+around tryFormat() when needed, holding the lock of the per-node count
+so that no other camera can acquire the node in between.
 
 Tested on a Surface Pro 7 with libcamera v0.7.0 plus out-of-tree IPU4P
 support patches, through PipeWire: with no camera in use PipeWire and
@@ -38,8 +39,8 @@ or run on master.
 This patch was written with the help of an AI coding assistant (an
 LLM).
 ---
- src/libcamera/pipeline/simple/simple.cpp | 77 ++++++++++++++++++++++++
- 1 file changed, 77 insertions(+)
+ src/libcamera/pipeline/simple/simple.cpp | 73 ++++++++++++++++++++++++
+ 1 file changed, 73 insertions(+)
 
 diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
 index 35c29cec..f7d3e6af 100644
@@ -59,7 +60,7 @@ index 35c29cec..f7d3e6af 100644
  
 +	bool acquireDevice(Camera *camera) override;
 +	void releaseDevice(Camera *camera) override;
-+	unsigned int videoUsers(V4L2VideoDevice *video);
++	Mutex &videoUsersLock() { return videoUsersLock_; }
 +
  	V4L2VideoDevice *video(const MediaEntity *entity);
  	V4L2Subdevice *subdev(const MediaEntity *entity);
@@ -78,14 +79,17 @@ index 35c29cec..f7d3e6af 100644
  	std::shared_ptr<MediaDevice> converter_;
  	bool swIspEnabled_;
  };
-@@ -1371,7 +1383,21 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
+@@ -1371,7 +1383,24 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
  			format.fourcc = data_->video_->toV4L2PixelFormat(cfg.pixelFormat);
  			format.size = cfg.size;
  
 +			/*
 +			 * The video node is closed while the camera is not
 +			 * acquired, see SimplePipelineHandler::acquireDevice().
++			 * Hold videoUsersLock_ so that no camera sharing the
++			 * node acquires it between the open and the close.
 +			 */
++			MutexLocker locker(data_->pipe()->videoUsersLock());
 +			bool opened = false;
 +			if (!data_->video_->isOpen()) {
 +				if (data_->video_->open() < 0)
@@ -94,13 +98,13 @@ index 35c29cec..f7d3e6af 100644
 +			}
 +
  			int ret = data_->video_->tryFormat(&format);
-+			/* Another camera may have acquired the node meanwhile */
-+			if (opened && !data_->pipe()->videoUsers(data_->video_))
++			if (opened)
 +				data_->video_->close();
++			locker.unlock();
  			if (ret < 0)
  				return Invalid;
  
-@@ -2019,9 +2045,60 @@ bool SimplePipelineHandler::matchDevice(std::shared_ptr<MediaDevice> media,
+@@ -2019,9 +2048,53 @@ bool SimplePipelineHandler::matchDevice(std::shared_ptr<MediaDevice> media,
  		registered = true;
  	}
  
@@ -118,13 +122,6 @@ index 35c29cec..f7d3e6af 100644
  	return registered;
  }
  
-+unsigned int SimplePipelineHandler::videoUsers(V4L2VideoDevice *video)
-+{
-+	MutexLocker locker(videoUsersLock_);
-+	auto it = videoUsers_.find(video);
-+	return it == videoUsers_.end() ? 0 : it->second;
-+}
-+
 +bool SimplePipelineHandler::acquireDevice(Camera *camera)
 +{
 +	SimpleCameraData *data = cameraData(camera);

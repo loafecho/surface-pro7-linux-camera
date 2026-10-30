@@ -3,16 +3,19 @@
 #   sp7-camcheck            everything
 #   sp7-camcheck quick      skip browsers and Snapshot
 #   sp7-camcheck ir         IR check only
-# Frames for eyeballing land in /tmp/sp7-camcheck/ (front.jpg, rear.jpg, ir.png).
+# Frames for eyeballing land in $XDG_RUNTIME_DIR/sp7-camcheck/ (front.jpg, rear.jpg, ir.png).
 # Helpers live in /usr/local/share/sp7-camcheck/.
 set -u
 MODE=${1:-all}
 H=/usr/local/share/sp7-camcheck
-OUT=/tmp/sp7-camcheck
-mkdir -p "$OUT"
 XDG_RUNTIME_DIR=/run/user/$(id -u)
 export XDG_RUNTIME_DIR
 export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
+# Frames go in the per-user runtime dir, not a fixed name in shared /tmp that
+# another account could pre-create or fill with symlinks.
+OUT=$XDG_RUNTIME_DIR/sp7-camcheck
+[ -e "$OUT" ] || mkdir -m 700 "$OUT"
+if [ -L "$OUT" ] || [ ! -d "$OUT" ] || [ ! -O "$OUT" ]; then echo "FAIL  $OUT is not a directory owned by $(id -un)"; exit 1; fi
 FRONT=libcamera_input.__SB_.PCI0.I2C2.CAMF
 REAR=libcamera_input.__SB_.PCI0.I2C3.CAMR
 IPU=/sys/bus/pci/devices/0000:00:05.0/power/runtime_status
@@ -96,7 +99,7 @@ if [ "$MODE" != ir ]; then
 			sleep 10
 			out=$(python3 $H/snapcheck.py 2>&1)
 			pkill -x snapshot
-			check "Snapshot streaming ($out)" bash -c "echo '$out' | grep -q 'state=running'"
+			check "Snapshot streaming ($out)" grep -q 'state=running' <<<"$out"
 		else
 			fail "Snapshot (no wayland session)"
 		fi
@@ -114,7 +117,7 @@ if [ -e /dev/video62 ]; then
 	out=$(python3 $H/devcheck.py /dev/video62 20 2 15 30 5 2>/dev/null)
 	echo "$out" | grep -E "BAD|failed" | head -3 | sed 's/^/INFO  ir /'
 	echo "$out" | grep "first-frame times" | sed 's/^/INFO  ir /'
-	check "IR /dev/video62 $(echo "$out" | tail -1 | sed 's/RESULT //') cycles >=15 fps" bash -c "echo '$out' | tail -1 | grep -qx 'RESULT 20/20'"
+	check "IR /dev/video62 $(echo "$out" | tail -1 | sed 's/RESULT //') cycles >=15 fps" grep -qx 'RESULT 20/20' <<<"$(tail -1 <<<"$out")"
 	timeout 40 python3 -c "
 import cv2,time; c=cv2.VideoCapture('/dev/video62',cv2.CAP_V4L2); t=time.time(); f=None; n=0
 while time.time()-t<30 and n<45:
